@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crab GLB demo</title>
+<style>
+body{margin:0;background:#171b20;color:#eee;font:15px system-ui,sans-serif}header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:16px}h1{font-size:18px;font-weight:500;margin:0 auto 0 0}button,label{border:1px solid #68717c;border-radius:6px;background:#262d35;color:inherit;padding:9px 12px;font:inherit;cursor:pointer}input{display:none}a{color:#9acbff}#view{height:calc(100dvh - 130px);min-height:360px}canvas{display:block;width:100%;height:100%;touch-action:none}footer{padding:10px 16px;color:#bbc4cf}#status{margin-right:18px}@media(max-width:500px){#view{height:calc(100dvh - 190px)}}
+</style>
+<script type="importmap">{"imports":{"three":"https://esm.sh/three@0.170.0","three/addons/":"https://esm.sh/three@0.170.0/examples/jsm/"}}</script>
+</head>
+<body>
+<header><h1>Crab GLB demo</h1><button id="play" disabled>Pause walk</button><button id="rig" aria-pressed="false" disabled>Show rig</button><label>Open GLB<input id="file" type="file" accept=".glb"></label><a href="crab-rigged.glb" download>Download GLB</a></header>
+<main id="view" role="img" aria-label="Interactive textured crab GLB with walking animation"></main>
+<footer><span id="status" role="status">Loading crab GLB…</span><span>Drag to rotate · Scroll or pinch to zoom</span></footer>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {RoomEnvironment} from 'three/addons/environments/RoomEnvironment.js';
+const view=document.getElementById('view'),status=document.getElementById('status'),play=document.getElementById('play'),rig=document.getElementById('rig');
+const renderer=new THREE.WebGLRenderer({antialias:true});renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.setClearColor(0x171b20);renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=.9;view.append(renderer.domElement);
+const scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(40,1,.01,100),controls=new OrbitControls(camera,renderer.domElement);controls.enableDamping=true;
+const environment=new RoomEnvironment(),pmrem=new THREE.PMREMGenerator(renderer);scene.environment=pmrem.fromScene(environment,.04).texture;environment.dispose();pmrem.dispose();
+scene.add(new THREE.HemisphereLight(0xffffff,0x7b899e,.7));const light=new THREE.DirectionalLight(0xffffff,1.2);light.position.set(2,4,3);scene.add(light);
+let model,mixer,helper,grid,playing=!matchMedia('(prefers-reduced-motion: reduce)').matches;
+const loader=new GLTFLoader();
+function install(gltf){
+  if(model){scene.remove(model);model.traverse(o=>{if(o.isMesh){o.geometry.dispose();for(const m of [o.material].flat()){for(const v of Object.values(m))if(v?.isTexture)v.dispose();m.dispose()}}});}
+  if(helper){scene.remove(helper);helper.dispose()}if(grid){scene.remove(grid);grid.geometry.dispose();grid.material.dispose()}
+  model=gltf.scene;scene.add(model);model.updateMatrixWorld(true);
+  const bounds=new THREE.Box3().setFromObject(model),center=bounds.getCenter(new THREE.Vector3()),size=bounds.getSize(new THREE.Vector3()),span=Math.max(size.x,size.y,size.z);
+  controls.target.copy(center);camera.position.copy(center).add(new THREE.Vector3(.85,.4,1.6).multiplyScalar(span*Math.max(1,1/camera.aspect)));camera.near=span/100;camera.far=span*50;camera.updateProjectionMatrix();controls.update();
+  grid=new THREE.GridHelper(span*3,24,0x657282,0x35404c);grid.position.y=bounds.min.y-.01;scene.add(grid);
+  helper=new THREE.SkeletonHelper(model);helper.visible=false;helper.material.depthTest=false;helper.renderOrder=10;scene.add(helper);
+  mixer=new THREE.AnimationMixer(model);if(gltf.animations.length)mixer.clipAction(gltf.animations[0]).play();
+  let triangles=0,joints=0;model.traverse(o=>{if(o.isMesh)triangles+=(o.geometry.index?.count??o.geometry.attributes.position.count)/3;if(o.isBone)joints++});
+  status.textContent=`${Math.round(triangles).toLocaleString()} triangles${joints?' · '+joints+' joints · Approximate rig':''}`;
+  view.setAttribute('aria-label',document.querySelector('h1').textContent+' interactive 3D model');
+  play.hidden=!gltf.animations.length;rig.hidden=!joints;play.disabled=!gltf.animations.length;rig.disabled=!joints;play.textContent=playing?'Pause walk':'Play walk';rig.textContent='Show rig';rig.setAttribute('aria-pressed','false');
+}
+function fail(error){status.textContent='Could not load GLB. Use Open GLB to select the local file.';console.error(error)}
+loader.load('crab-rigged.glb',install,undefined,fail);
+play.addEventListener('click',()=>{playing=!playing;play.textContent=playing?'Pause walk':'Play walk'});
+rig.addEventListener('click',()=>{helper.visible=!helper.visible;rig.textContent=helper.visible?'Hide rig':'Show rig';rig.setAttribute('aria-pressed',String(helper.visible))});
+document.getElementById('file').addEventListener('change',async event=>{const file=event.target.files[0];if(!file)return;status.textContent='Loading '+file.name;try{loader.parse(await file.arrayBuffer(),'',install,fail)}catch(error){fail(error)}});
+new ResizeObserver(()=>{const width=view.clientWidth,height=view.clientHeight;renderer.setSize(width,height);camera.aspect=width/height;camera.updateProjectionMatrix()}).observe(view);
+const clock=new THREE.Clock();function frame(){requestAnimationFrame(frame);const delta=Math.min(clock.getDelta(),.1);if(mixer&&playing)mixer.update(delta);controls.update();renderer.render(scene,camera)}frame();
+</script>
+</body></html>

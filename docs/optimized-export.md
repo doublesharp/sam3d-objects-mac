@@ -12,7 +12,7 @@ Diffusion uses MPS on Apple Silicon. Mesh decoding defaults to the verified CPU 
 
 Repair skips sources that pass strict manifold, orientation and self-intersection checks. Automatic settings use principal-axis thickness, independent of object rotation: thin objects use a 224-cell longest axis and a two-cell closing radius; compact objects use 192 and four. The geometry is checked for finite values, closed manifold edges and vertices, no triangle self-intersections, consistent winding, bounds retention, bidirectional surface-area error, and interior-volume preservation. Unresolved large openings or insufficient enclosed interior cause a rejection rather than a fabricated successful result. Reports are saved as `mesh_repair_report.json` and `mesh_game_repair_report.json` and included in GLB metadata.
 
-Intentional cavities, thin walls, and small features still need visual inspection. A rejected large missing surface needs a new reconstruction or a deliberate modeling edit.
+Intentional cavities, thin walls, and small features still need visual inspection. A rejected large missing surface needs a new reconstruction or a deliberate modeling edit. Rigging follows geometry repair; a rig specialized for one animal should not be applied to another.
 
 ## Settings
 
