@@ -21,12 +21,23 @@ Intentional cavities, thin walls, and small features still need visual inspectio
 | `SAM3D_SURFACE_REPAIR` | `1` | Set `0` to disable automatic repair. |
 | `SAM3D_REPAIR_RESOLUTION` | `auto` | Override the longest grid axis, 32–320. |
 | `SAM3D_REPAIR_RADIUS` | `auto` | Override closing radius, 0–6 cells. |
+| `SAM3D_REPAIR_FORCE` | `0` | Opt in to cavity cleanup even when a source mesh is already closed. |
 | `SAM3D_TEXTURE_MODE` | `gaussian` | Use `average` for the prior multiview texture bake, or `opt`/`fast` for older bake modes. |
 | `SAM3D_EXPERIMENTAL_COLOR_NEIGHBORS` | `16` | Local Gaussian samples per texel. |
 | `SAM3D_MESH_DECODE_DEVICE` | `auto` | Force `cpu`, `mps`, or `cuda` for controlled experiments. |
 | `SAM3D_CPU_DECODE_VOXELS` | `0` | On MPS hosts, keep automatic mesh decoding on CPU at or above this voxel count. |
 
-Existing loadable `mesh.glb` files are reused as fitting inputs. Set `SAM3D_GAME_REBUILD_SOURCE_GLB=1` only when deliberately rebuilding that file from `slat.pt`. Save an original copy first if it must be retained.
+Existing loadable `mesh.glb` files are reused as fitting inputs. Set `SAM3D_GAME_REBUILD_SOURCE_GLB=1` only when deliberately rebuilding that file from `slat.pt`. Save an original copy first if it must be retained. Forced cleanup of an existing source also needs this rebuild flag; otherwise the source is reused. Force applies once to the detailed source, after component cleanup and before game fitting. It skips preliminary polygon reduction so repair sees the original surface; the repair stage retains its 160,000-face limit. It can change intentional cavities and needs visual inspection.
+
+For a porous reconstruction, a separately qualified stronger cleanup can be requested:
+
+```sh
+SAM3D_GAME_REBUILD_SOURCE_GLB=1 SAM3D_REPAIR_FORCE=1 \
+SAM3D_REPAIR_RESOLUTION=128 SAM3D_REPAIR_RADIUS=6 \
+SPARSE_BACKEND=native .venv/bin/python ply2glb.py outputs/your-object
+```
+
+This profile was checked on the whale's unintended side tunnels. It is an explicit override rather than a universal default. Surface fidelity and bounds checks still apply. Interior accounting includes volume sealed by closing as well as flood fill.
 
 ## Measurements on M2 Max
 

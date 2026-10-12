@@ -1572,6 +1572,7 @@ def to_glb(
     repair_resolution: Optional[int] = None,
     repair_closing_radius: Optional[int] = None,
     repair_report_path: Optional[str] = None,
+    repair_force: Optional[bool] = None,
 ) -> trimesh.Trimesh:
     """
     Convert a generated asset to a glb file.
@@ -1592,6 +1593,8 @@ def to_glb(
     repair_enabled = surface_repair if surface_repair is not None else (
         with_mesh_postprocess and os.environ.get("SAM3D_SURFACE_REPAIR", "1").lower() not in ("0", "false", "off", "no")
     )
+    if repair_force is None:
+        repair_force = os.environ.get("SAM3D_REPAIR_FORCE", "0").lower() not in ("0", "false", "off", "no")
     export_vertex_normals = None
     repair_stats = None
     def repair_before_fit(source_vertices, source_faces):
@@ -1600,7 +1603,7 @@ def to_glb(
         from sam3d_objects.surface_repair import repair_surface as repair_geometry, RepairRejected
         try:
             repaired = repair_geometry(source_vertices, source_faces, resolution=repair_resolution,
-                                       closing_radius=repair_closing_radius)
+                                       closing_radius=repair_closing_radius, force=repair_force)
         except RepairRejected as exc:
             if repair_report_path:
                 with open(repair_report_path, "w") as report_file:
@@ -1938,7 +1941,7 @@ def to_glb(
         vertices, faces = postprocess_mesh(
             vertices,
             faces,
-            simplify=simplify > 0,
+            simplify=simplify > 0 and not (repair_enabled and repair_force),
             simplify_ratio=simplify,
             fill_holes=fill_holes and not repair_enabled,
             fill_holes_max_hole_size=fill_holes_max_size,
