@@ -269,6 +269,48 @@ def _fill_holes(
     return verts, faces
 
 
+def _remove_floaters_cpu(vertices, faces, floater_frac, verbose):
+    # Drop disconnected debris before decimation can change component topology.
+    ft = torch.tensor(faces.astype(np.int64), device="cpu")
+    vt = torch.tensor(vertices, device="cpu").float()
+    ccs = utils3d.torch.compute_connected_components(ft)
+    if len(ccs) > 1:
+        threshold = max(50, int(floater_frac * max(len(cc) for cc in ccs)))
+        keep = [cc for cc in ccs if len(cc) >= threshold]
+        if keep:
+            ft = ft[torch.cat(keep)]
+            ft, vt = utils3d.torch.remove_unreferenced_vertices(ft, vt)
+            vertices, faces = vt.numpy(), ft.numpy()
+            if verbose:
+                tqdm.write(f"After floater removal: kept {len(keep)}/{len(ccs)} components, "
+                           f"{len(vertices)} vertices, {len(faces)} faces")
+    return vertices, faces
+
+
+def _validated_simplification(source_vertices, source_faces, vertices, faces, ratio, verbose):
+    from sam3d_objects.surface_repair import topology, validate_repair, RepairRejected
+    source = topology(source_vertices, source_faces)
+    if not source['watertight'] or not source['winding_consistent']:
+        return vertices, faces
+    try:
+        validate_repair(source_vertices, source_faces, vertices, faces)
+        return vertices, faces
+    except (RepairRejected, ValueError):
+        if verbose:
+            tqdm.write("Simplification damaged a closed surface; trying validated Open3D reduction")
+    alternate = _open3d_mesh_from_arrays(source_vertices, source_faces).simplify_quadric_decimation(
+        target_number_of_triangles=max(4, int(len(source_faces) * (1 - ratio))), boundary_weight=20.0)
+    alternate_vertices = np.asarray(alternate.vertices, dtype=np.float32)
+    alternate_faces = np.asarray(alternate.triangles, dtype=np.int64)
+    try:
+        validate_repair(source_vertices, source_faces, alternate_vertices, alternate_faces)
+        return alternate_vertices, alternate_faces
+    except (RepairRejected, ValueError):
+        if verbose:
+            tqdm.write("Both reductions failed validation; retaining the original closed surface")
+        return source_vertices, source_faces
+
+
 def postprocess_mesh(
     vertices: np.array,
     faces: np.array,
@@ -291,7 +333,7 @@ def postprocess_mesh(
         vertices (np.array): Vertices of the mesh. Shape (V, 3).
         faces (np.array): Faces of the mesh. Shape (F, 3).
         simplify (bool): Whether to simplify the mesh, using quadric edge collapse.
-        simplify_ratio (float): Ratio of faces to keep after simplification.
+        simplify_ratio (float): Ratio of faces to remove during simplification.
         fill_holes (bool): Whether to fill holes in the mesh.
         fill_holes_max_hole_size (float): Maximum area of a hole to fill.
         fill_holes_max_hole_nbe (int): Maximum number of boundary edges of a hole to fill.
@@ -310,8 +352,12 @@ def postprocess_mesh(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
 
+    if remove_floaters:
+        vertices, faces = _remove_floaters_cpu(vertices, faces, floater_frac, verbose)
+
     # Simplify
     if simplify and simplify_ratio > 0:
+        source_vertices, source_faces = vertices, faces
         mesh = pv.PolyData(
             vertices, np.concatenate([np.full((faces.shape[0], 1), 3), faces], axis=1)
         )
@@ -319,6 +365,8 @@ def postprocess_mesh(
         mesh = mesh.triangulate()
         mesh = mesh.decimate(simplify_ratio, progress_bar=verbose)
         vertices, faces = mesh.points, mesh.faces.reshape(-1, 4)[:, 1:]
+        vertices, faces = _validated_simplification(
+            source_vertices, source_faces, vertices, faces, simplify_ratio, verbose)
         if verbose:
             tqdm.write(
                 f"After simplify: {vertices.shape[0]} vertices, {faces.shape[0]} faces"
@@ -355,36 +403,9 @@ def postprocess_mesh(
                 f"After remove invisible faces: {vertices.shape[0]} vertices, {faces.shape[0]} faces"
             )
 
-    # Drop small disconnected pieces ("floaters"): cleanup + mincut can leave dozens
-    # of tiny islands. Keep only components with at least floater_frac of the largest
-    # component's face count (with a small absolute floor).
-    if remove_floaters and _dev == "mps" and faces.shape[0] > 300_000:
-        if verbose:
-            tqdm.write(
-                "Skipping MPS floater cleanup for large mesh "
-                f"({faces.shape[0]:,} faces); keeping the mesh on the CPU path."
-            )
-        remove_floaters = False
-
-    if remove_floaters:
-        # Arrays are already on CPU; graph cleanup gains nothing from an MPS round trip.
-        ft = torch.tensor(faces.astype(np.int64), device="cpu")
-        vt = torch.tensor(vertices, device="cpu").float()
-        ccs = utils3d.torch.compute_connected_components(ft)
-        if len(ccs) > 1:
-            largest = max(len(cc) for cc in ccs)
-            thresh = max(50, int(floater_frac * largest))
-            keep = [cc for cc in ccs if len(cc) >= thresh]
-            if keep:
-                keep_idx = torch.cat(keep)
-                ft = ft[keep_idx]
-                ft, vt = utils3d.torch.remove_unreferenced_vertices(ft, vt)
-                vertices, faces = vt.cpu().numpy(), ft.cpu().numpy()
-                if verbose:
-                    tqdm.write(
-                        f"After floater removal: kept {len(keep)}/{len(ccs)} components, "
-                        f"{vertices.shape[0]} vertices, {faces.shape[0]} faces"
-                    )
+    # Visibility cleanup can create new disconnected debris.
+    if remove_floaters and fill_holes:
+        vertices, faces = _remove_floaters_cpu(vertices, faces, floater_frac, verbose)
 
     return vertices, faces
 
@@ -842,6 +863,12 @@ def _collapse_skinny_open3d_triangles(mesh, verbose=False, label="Game mesh sliv
     if triangles.shape[0] == 0:
         return mesh
 
+    from sam3d_objects.surface_repair import topology, validate_repair, RepairRejected
+    original_vertices = np.asarray(mesh.vertices, dtype=np.float32).copy()
+    original_faces = triangles.astype(np.int64, copy=True)
+    original_topology = topology(original_vertices, original_faces)
+    preserve_closed = original_topology['watertight'] and original_topology['winding_consistent']
+
     aspect_limit = float(os.environ.get("SAM3D_GAME_SLIVER_ASPECT", "30"))
     edge_frac = float(os.environ.get("SAM3D_GAME_SLIVER_EDGE_FRAC", "0.004"))
     edge_mult = float(os.environ.get("SAM3D_GAME_SLIVER_EDGE_MULT", "0.25"))
@@ -937,7 +964,16 @@ def _collapse_skinny_open3d_triangles(mesh, verbose=False, label="Game mesh sliv
         if not bool(valid.any()):
             break
 
-        mesh = _open3d_mesh_from_arrays(new_vertices, new_triangles[valid])
+        candidate = _open3d_mesh_from_arrays(new_vertices, new_triangles[valid])
+        if preserve_closed:
+            try:
+                validate_repair(original_vertices, original_faces,
+                                np.asarray(candidate.vertices), np.asarray(candidate.triangles))
+            except (RepairRejected, ValueError):
+                if verbose:
+                    tqdm.write(f"{label}: rejected collapse that damaged the closed surface")
+                break
+        mesh = candidate
         total_collapsed += int(candidates.size)
 
     if verbose and total_collapsed:

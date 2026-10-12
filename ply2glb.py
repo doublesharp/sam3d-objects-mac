@@ -444,18 +444,17 @@ def main():
         f"{game_sidecar_base}_normal.png",
     )
     export_glb_path = os.path.join(game_temp_dir, out_name)
-    if on_mps:
+    if settings["texture_mode"] == "gaussian":
+        step(f"Clean source mesh → game mesh → direct Gaussian texture bake ({texture_size}px atlas)…")
+    elif on_mps:
         step(
             "Clean source mesh → game mesh → streamed texture bake "
             + f"({texture_views} views @ {texture_render_resolution}px, {texture_size}px atlas)…"
         )
     else:
         step("Running to_glb (texture baking ~1 min)…")
-    # Full pipeline now runs on MPS via pure-PyTorch rasterizers:
-    #   - mesh postprocess: mesh simplification (triangulated first) + _fill_holes (z-buffered
-    #     software mesh raster instead of nvdiffrast)
-    #   - texture baking: gsplat_silicon multi-view render + z-buffered UV raster + grid_sample
-    # fill_holes views/resolution are reduced on MPS so the software rasterizer stays tractable.
+    # Geometry cleanup and the direct Gaussian bake use CPU implementations.
+    # Legacy texture modes retain the MPS-compatible multiview renderer.
     try:
         if should_write_source_glb:
             if mesh_result is None:
