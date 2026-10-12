@@ -240,7 +240,7 @@ def bake_gaussian_color_texture(
     opacity = opacity[valid]
     normals = normals[valid]
     tree = cKDTree(points)
-    neighbors = max(4, int(_env_float("SAM3D_EXPERIMENTAL_COLOR_NEIGHBORS", 48)))
+    neighbors = max(4, int(_env_float("SAM3D_EXPERIMENTAL_COLOR_NEIGHBORS", 16)))
     neighbors = min(neighbors, points.shape[0])
     chunk_size = 100_000
     baked = np.zeros((covered.shape[0], 3), dtype=np.float32)

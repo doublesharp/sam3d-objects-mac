@@ -11,8 +11,11 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="$SCRIPT_DIR/../s3d_env"
+VENV="$SCRIPT_DIR/.venv"
 PY="$VENV/bin/python3"
+if [[ ! -x "$PY" ]]; then
+    PY="$SCRIPT_DIR/../s3d_env/bin/python3"
+fi
 [[ -x "$PY" ]] || PY="python3"     # fall back to whatever python3 is on PATH
 
 # Disable the MPS memory cap so the pipeline isn't silently killed mid-inference.

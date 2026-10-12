@@ -60,10 +60,20 @@ def choose_mesh_decode_device(render_device, active_voxels):
             return render_device, "requested cuda is unavailable"
         return requested, f"forced by SAM3D_MESH_DECODE_DEVICE={requested}"
 
-    cpu_threshold = int_env("SAM3D_CPU_DECODE_VOXELS", 30000)
+    cpu_threshold = int_env("SAM3D_CPU_DECODE_VOXELS", 0)
     if torch.device(render_device).type == "mps" and active_voxels >= cpu_threshold:
-        return "cpu", f"large SLAT ({active_voxels:,} voxels >= {cpu_threshold:,})"
+        return "cpu", ("verified CPU mesh decode on MPS hosts" if cpu_threshold <= 0 else f"large SLAT ({active_voxels:,} voxels >= {cpu_threshold:,})")
     return render_device, "auto"
+
+
+def export_settings():
+    from sam3d_objects.surface_repair import optional_repair_setting
+    mode=os.environ.get("SAM3D_TEXTURE_MODE", "gaussian").strip().lower()
+    if mode not in ("gaussian", "average", "opt", "fast"):
+        raise ValueError("SAM3D_TEXTURE_MODE must be gaussian, average, opt, or fast")
+    return dict(texture_mode=mode, surface_repair=bool_env("SAM3D_SURFACE_REPAIR", True),
+                repair_resolution=optional_repair_setting(os.environ.get("SAM3D_REPAIR_RESOLUTION")),
+                repair_closing_radius=optional_repair_setting(os.environ.get("SAM3D_REPAIR_RADIUS")))
 
 
 def make_progress(extra_units=0):
@@ -417,6 +427,7 @@ def main():
     from sam3d_objects.model.backbone.tdfy_dit.utils.postprocessing_utils import to_glb
     import torch as _t
     on_mps = torch.device(render_device).type == "mps"
+    settings = export_settings()
     texture_views = int_env("SAM3D_TEXTURE_VIEWS", 100)
     texture_render_resolution = int_env("SAM3D_TEXTURE_RENDER_RES", 1024)
     texture_size = int_env("SAM3D_TEXTURE_SIZE", 2048)
@@ -470,7 +481,8 @@ def main():
                 experimental_target_faces=None,
                 experimental_quad_path=None,
                 experimental_normal_path=None,
-                texture_mode="average",
+                **settings,
+                repair_report_path=os.path.join(folder, "mesh_repair_report.json"),
                 with_mesh_postprocess=True,
                 with_texture_baking=True,
                 use_vertex_color=False,
@@ -523,7 +535,8 @@ def main():
             experimental_quad_path=game_quad_path,
             experimental_normal_path=game_normal_path,
             experimental_source_is_clean=True,
-            texture_mode="average",  # smooth angle-weighted multi-view average (no Adam patchiness)
+            **settings,
+            repair_report_path=os.path.join(folder, "mesh_game_repair_report.json"),
             with_mesh_postprocess=True,   # includes floater removal (remove_floaters default on)
             with_texture_baking=True,
             use_vertex_color=False,

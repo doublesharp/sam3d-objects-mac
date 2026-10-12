@@ -11,6 +11,8 @@ from torch.utils._pytree import tree_map_only
 def set_attention_backend():
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
+    elif torch.backends.mps.is_available():
+        gpu_name = "Apple Silicon MPS"
     else:
         gpu_name = "CPU"
 
@@ -616,12 +618,16 @@ class InferencePipeline:
             f"Postprocessing mesh with option with_mesh_postprocess {with_mesh_postprocess}, with_texture_baking {with_texture_baking}..."
         )
         if "mesh" in outputs:
+            from sam3d_objects.surface_repair import optional_repair_setting
             glb = postprocessing_utils.to_glb(
                 outputs["gaussian"][0],
                 outputs["mesh"][0],
                 # Optional parameters
                 simplify=0.95,  # Ratio of triangles to remove in the simplification process
                 texture_size=1024,  # Size of the texture used for the GLB
+                texture_mode=os.environ.get("SAM3D_TEXTURE_MODE", "gaussian"),
+                repair_resolution=optional_repair_setting(os.environ.get("SAM3D_REPAIR_RESOLUTION")),
+                repair_closing_radius=optional_repair_setting(os.environ.get("SAM3D_REPAIR_RADIUS")),
                 verbose=False,
                 with_mesh_postprocess=with_mesh_postprocess,
                 with_texture_baking=with_texture_baking,

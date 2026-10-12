@@ -273,7 +273,8 @@ class InferencePipelinePointMap(InferencePipeline):
             with torch.no_grad():
                 with torch.autocast(device_type=self.device.type, dtype=self.dtype):
                     output = self.depth_model(loaded_image)
-            pointmaps = output["pointmaps"]
+            # Camera transforms require float32 even when depth inference uses fp16.
+            pointmaps = output["pointmaps"].float()
             camera_convention_transform = (
                 Transform3d()
                 .rotate(camera_to_pytorch3d_camera(device=self.device).rotation)

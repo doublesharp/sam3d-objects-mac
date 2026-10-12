@@ -11,6 +11,7 @@
 from __future__ import annotations
 import torch
 import torch.nn as nn
+import numpy as np
 from typing import Optional, Tuple
 
 from .native_backend import NativeSparseData
@@ -38,46 +39,56 @@ def _build_coord_map(indices: torch.Tensor) -> dict:
 
 
 def _subm_forward(
-    feats: torch.Tensor,       # [N, Cin]
-    indices: torch.Tensor,     # [N, 4] int64
-    weight: torch.Tensor,      # [Kz, Ky, Kx, Cin, Cout]
+    feats: torch.Tensor,
+    indices: torch.Tensor,
+    weight: torch.Tensor,
     bias: Optional[torch.Tensor],
+    neighbor_cache: Optional[dict] = None,
 ) -> torch.Tensor:
-    """Submanifold conv: output coords == input coords."""
+    """Submanifold convolution with a bounded, per-module neighbor-map cache."""
     Kz, Ky, Kx, Cin, Cout = weight.shape
-    N = feats.shape[0]
-    out = torch.zeros(N, Cout, dtype=feats.dtype, device=feats.device)
+    kernel_shape = (Kz, Ky, Kx)
+    cpu_idx = indices.cpu().numpy()
+    entry = neighbor_cache.get("entry") if neighbor_cache is not None else None
+    # Compare values, not tensor identity: diffusion reconstructs identical
+    # coordinate tensors every step. Snapshotting also detects in-place edits.
+    if (entry is not None and entry[0] == kernel_shape and entry[1] == feats.device
+            and np.array_equal(entry[2], cpu_idx)):
+        pairs = entry[3]
+    else:
+        coord_map = {
+            tuple(int(value) for value in row): i for i, row in enumerate(cpu_idx)
+        }
+        pairs = []
+        for kz in range(Kz):
+            for ky in range(Ky):
+                for kx in range(Kx):
+                    dz, dy, dx = kz - Kz // 2, ky - Ky // 2, kx - Kx // 2
+                    src_idx, nb_idx = [], []
+                    for i, row in enumerate(cpu_idx):
+                        b, z, y, x = (int(value) for value in row)
+                        j = coord_map.get((b, z + dz, y + dy, x + dx))
+                        if j is not None:
+                            src_idx.append(i)
+                            nb_idx.append(j)
+                    pairs.append((
+                        torch.tensor(src_idx, dtype=torch.long, device=feats.device),
+                        torch.tensor(nb_idx, dtype=torch.long, device=feats.device),
+                    ))
+        if neighbor_cache is not None:
+            # One atomic replacement; concurrent callers retain their local entry.
+            neighbor_cache["entry"] = (kernel_shape, feats.device, cpu_idx.copy(), pairs)
 
-    coord_map = _build_coord_map(indices)
-
+    out = torch.zeros(feats.shape[0], Cout, dtype=feats.dtype, device=feats.device)
+    pair_index = 0
     for kz in range(Kz):
-        dz = kz - Kz // 2
         for ky in range(Ky):
-            dy = ky - Ky // 2
             for kx in range(Kx):
-                dx = kx - Kx // 2
-                W = weight[kz, ky, kx]  # [Cin, Cout]
-
-                nb_idx = []
-                src_idx = []
-                cpu_idx = indices.cpu()
-                for i in range(N):
-                    b = int(cpu_idx[i, 0])
-                    nz = int(cpu_idx[i, 1]) + dz
-                    ny = int(cpu_idx[i, 2]) + dy
-                    nx = int(cpu_idx[i, 3]) + dx
-                    j = coord_map.get((b, nz, ny, nx))
-                    if j is not None:
-                        nb_idx.append(j)
-                        src_idx.append(i)
-
-                if src_idx:
-                    src_t = torch.tensor(src_idx, device=feats.device)
-                    nb_t = torch.tensor(nb_idx, device=feats.device)
-                    gathered = feats[nb_t]         # [M, Cin]
-                    contrib = (gathered @ W).to(out.dtype)  # [M, Cout]
+                src_t, nb_t = pairs[pair_index]
+                pair_index += 1
+                if src_t.numel():
+                    contrib = (feats[nb_t] @ weight[kz, ky, kx]).to(out.dtype)
                     out.index_add_(0, src_t, contrib)
-
     if bias is not None:
         out = out + bias
     return out
@@ -102,7 +113,7 @@ def _sparse_forward(
 
     # Compute output coords: floor(in_coord / stride), for each voxel × kernel offset
     out_coord_set: set = set()
-    cpu_idx = indices.cpu()
+    cpu_idx = indices.cpu().numpy()
 
     for i in range(len(cpu_idx)):
         b = int(cpu_idx[i, 0])
@@ -208,6 +219,7 @@ class SparseConv3d(nn.Module):
         )
         self.padding = padding if padding is not None else 0
         self._is_subm = all(s == 1 for s in self.stride) and padding is None
+        self._subm_neighbor_cache = {}
 
         K = kernel_size
         # Weight: [K, K, K, in_ch, out_ch]  (matches spconv checkpoint layout)
@@ -221,7 +233,8 @@ class SparseConv3d(nn.Module):
 
         if self._is_subm:
             out_feats = _subm_forward(feats, indices, self.weight.float(),
-                                       self.bias.float() if self.bias is not None else None)
+                                       self.bias.float() if self.bias is not None else None,
+                                       neighbor_cache=self._subm_neighbor_cache)
             out_feats = out_feats.to(x.feats.dtype)
             new_data = NativeSparseData(out_feats, x.coords, x.data.spatial_shape, x.data.batch_size)
             new_data.indice_dict = x.data.indice_dict
@@ -325,7 +338,7 @@ class SparseInverseConv3d(nn.Module):
 
         # Collect fine output coords (all possible fine voxels)
         fine_coord_set: set = set()
-        cpu_coarse = coarse_idx.cpu()
+        cpu_coarse = coarse_idx.cpu().numpy()
         for i in range(len(cpu_coarse)):
             b = int(cpu_coarse[i, 0])
             z = int(cpu_coarse[i, 1])
