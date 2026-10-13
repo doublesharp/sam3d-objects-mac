@@ -13,6 +13,9 @@ repair safeguards, and M2 Max timings,
 [PORT_LOG.md](PORT_LOG.md) for the port changes, and
 [README.upstream.md](README.upstream.md) for Meta's original README.
 
+New finished exports use 4K textures; previews can use 2K. See
+[texture rebaking](docs/texture-rebake.md) for saved models.
+
 > ⚠️ This is an unofficial community port. The model, weights and the
 > **SAM License** ([LICENSE](LICENSE)) belong to Meta. Your use of the weights
 > is governed by that license — this repository only adds macOS glue code.
