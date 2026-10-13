@@ -433,15 +433,22 @@ def _bounded_source_runtime_mesh(
     faces: np.ndarray,
     max_faces: int,
     verbose: bool = False,
+    max_vertices: Optional[int] = None,
 ):
     mesh = _open3d_mesh_from_arrays(vertices, faces)
     before = {
         "vertices": int(np.asarray(mesh.vertices).shape[0]),
         "faces": int(np.asarray(mesh.triangles).shape[0]),
     }
-    if before["faces"] > max_faces:
+    reduction_target = int(max_faces)
+    if (max_vertices is not None and mesh.is_edge_manifold(allow_boundary_edges=False)
+            and _connected_component_count(mesh) == 1):
+        # A closed connected genus-zero surface has V = F / 2 + 2.
+        # Leave room for those two vertices; higher genus uses fewer vertices.
+        reduction_target = min(reduction_target, max(4, 2 * int(max_vertices) - 4))
+    if before["faces"] > reduction_target:
         mesh = mesh.simplify_quadric_decimation(
-            target_number_of_triangles=max_faces,
+            target_number_of_triangles=reduction_target,
             boundary_weight=20.0,
         )
         mesh = _clean_open3d_mesh(mesh)
@@ -1573,6 +1580,7 @@ def to_glb(
     repair_closing_radius: Optional[int] = None,
     repair_report_path: Optional[str] = None,
     repair_force: Optional[bool] = None,
+    repair_profile: Optional[str] = None,
 ) -> trimesh.Trimesh:
     """
     Convert a generated asset to a glb file.
@@ -1595,21 +1603,34 @@ def to_glb(
     )
     if repair_force is None:
         repair_force = os.environ.get("SAM3D_REPAIR_FORCE", "0").lower() not in ("0", "false", "off", "no")
+    from sam3d_objects.surface_repair import repair_profile_setting
+    repair_profile = repair_profile_setting(repair_profile or os.environ.get("SAM3D_REPAIR_PROFILE"))
+    if repair_enabled and repair_profile == "protected-detail":
+        repair_force = True  # Preserve original detail before rebuilding the body core.
     export_vertex_normals = None
     repair_stats = None
+    repair_reference_vertices = repair_reference_faces = None
     def repair_before_fit(source_vertices, source_faces):
-        nonlocal repair_stats
+        nonlocal repair_stats, repair_reference_vertices, repair_reference_faces
         import json
         from sam3d_objects.surface_repair import repair_surface as repair_geometry, RepairRejected
         try:
-            repaired = repair_geometry(source_vertices, source_faces, resolution=repair_resolution,
-                                       closing_radius=repair_closing_radius, force=repair_force)
+            if repair_profile == "protected-detail":
+                from sam3d_objects.detail_repair import repair_with_protected_detail
+                repaired = repair_with_protected_detail(
+                    source_vertices, source_faces,
+                    resolution=repair_resolution if repair_resolution is not None else 256,
+                    closing_radius=repair_closing_radius if repair_closing_radius is not None else 8)
+            else:
+                repaired = repair_geometry(source_vertices, source_faces, resolution=repair_resolution,
+                                           closing_radius=repair_closing_radius, force=repair_force)
         except RepairRejected as exc:
             if repair_report_path:
                 with open(repair_report_path, "w") as report_file:
                     json.dump(exc.report, report_file, indent=2)
             raise
         repair_stats = repaired.report
+        repair_reference_vertices, repair_reference_faces = repaired.vertices.copy(), repaired.faces.copy()
         if repair_report_path:
             with open(repair_report_path, "w") as report_file:
                 json.dump(repair_stats, report_file, indent=2)
@@ -1644,7 +1665,7 @@ def to_glb(
             experimental_reference_vertices, experimental_reference_faces = postprocess_mesh(
                 vertices.copy(),
                 faces.copy(),
-                simplify=source_simplify,
+                simplify=source_simplify and not (repair_enabled and repair_force),
                 simplify_ratio=source_simplify_ratio,
                 fill_holes=fill_holes and not repair_enabled,
                 fill_holes_max_hole_size=fill_holes_max_size,
@@ -1672,7 +1693,10 @@ def to_glb(
             + 0.5
         )
         max_game_vertices = int(os.environ.get("SAM3D_GAME_MAX_VERTICES", "10000"))
-        max_game_faces = int(os.environ.get("SAM3D_GAME_MAX_FACES", "20000"))
+        max_game_faces = min(
+            int(experimental_target_faces if experimental_target_faces is not None else 20000),
+            int(os.environ.get("SAM3D_GAME_MAX_FACES", "20000")),
+        )
         runtime_source_fallback = False
         skip_runtime_cleanup = False
         source_within_budget = (
@@ -1738,6 +1762,7 @@ def to_glb(
                     experimental_reference_faces,
                     max_faces=max_game_faces,
                     verbose=verbose,
+                    max_vertices=max_game_vertices,
                 )
                 if vertices.size == 0 or faces.size == 0:
                     raise
@@ -1819,24 +1844,13 @@ def to_glb(
                 "vertices": int(vertices.shape[0]),
                 "faces": int(faces.shape[0]),
             }
-            budget_mesh = _open3d_mesh_from_arrays(
+            budget_vertices, budget_faces, _ = _bounded_source_runtime_mesh(
                 experimental_reference_vertices,
                 experimental_reference_faces,
-            )
-            budget_mesh = _clean_open3d_mesh(budget_mesh)
-            if np.asarray(budget_mesh.triangles).shape[0] > max_game_faces:
-                budget_mesh = budget_mesh.simplify_quadric_decimation(
-                    target_number_of_triangles=max_game_faces,
-                    boundary_weight=20.0,
-                )
-                budget_mesh = _clean_open3d_mesh(budget_mesh)
-            budget_mesh = _collapse_skinny_open3d_triangles(
-                budget_mesh,
+                max_faces=max_game_faces,
                 verbose=verbose,
-                label="Game runtime budget sliver cleanup",
+                max_vertices=max_game_vertices,
             )
-            budget_vertices = np.asarray(budget_mesh.vertices, dtype=np.float32)
-            budget_faces = np.asarray(budget_mesh.triangles, dtype=np.int64)
             if budget_vertices.size and budget_faces.size:
                 if verbose:
                     tqdm.write(
@@ -1955,15 +1969,71 @@ def to_glb(
 
     if repair_enabled:
         from scipy.spatial import cKDTree
-        from sam3d_objects.surface_repair import topology, RepairRejected
+        from sam3d_objects.surface_repair import topology, geometry_report, validate_repair, RepairRejected
         from sam3d_objects.experimental_retopo import seamless_vertex_normals
         if not game_remesh and not experimental_retopo:
             vertices, faces = repair_before_fit(vertices, faces)
         else:
             # Optimization must retain the closed surface and its own polygon budget.
+            requested_faces = experimental_target_faces if experimental_retopo else game_target_faces
+            final_face_cap = min(
+                int(requested_faces if requested_faces is not None else 20000),
+                int(os.environ.get("SAM3D_GAME_MAX_FACES", "20000")),
+            )
+            final_vertex_cap = int(os.environ.get("SAM3D_GAME_MAX_VERTICES", "10000"))
             final_topology = topology(vertices, faces)
-            if not final_topology['watertight'] or not final_topology['winding_consistent']:
-                raise RepairRejected('Game optimization broke the repaired surface', {'status':'rejected','after':final_topology})
+            final_geometry = geometry_report(vertices, faces)
+            if not final_geometry['strict_watertight'] or not final_geometry['orientable'] or not final_topology['winding_consistent']:
+                from sam3d_objects.surface_repair import repair_game_surface
+                repaired_game = repair_game_surface(
+                    repair_reference_vertices, repair_reference_faces, vertices, faces,
+                    max_faces=final_face_cap, max_vertices=final_vertex_cap)
+                vertices, faces = repaired_game.vertices, repaired_game.faces
+                repair_stats = {**(repair_stats or {}), "game_cleanup": repaired_game.report}
+                if repair_report_path:
+                    import json
+                    with open(repair_report_path, "w") as report_file:
+                        json.dump(repair_stats, report_file, indent=2)
+                if experimental_retopo:
+                    # Local face cleanup replaces the pre-UV mesh; regenerate
+                    # matching normals and the triangular fallback sidecar.
+                    from sam3d_objects.experimental_retopo import transfer_surface_normals, write_quad_obj
+                    experimental_pre_uv_normals = transfer_surface_normals(
+                        experimental_guide_vertices, experimental_guide_faces, vertices, faces)
+                    if experimental_quad_path:
+                        export_rotation = np.array([[1,0,0],[0,0,-1],[0,1,0]])
+                        write_quad_obj(experimental_quad_path, vertices @ export_rotation,
+                                       np.empty((0,4),dtype=np.int64), faces)
+                    experimental_report_stats = {**(experimental_report_stats or {}),
+                                                 "game_cleanup": repaired_game.report}
+            counts = {"triangles": len(faces), "vertices": len(vertices),
+                      "target_faces": final_face_cap, "target_vertices": final_vertex_cap}
+            if len(faces) > final_face_cap or len(vertices) > final_vertex_cap:
+                rejected = {"status": "rejected", "stage": "final-game-validation", **counts}
+                if repair_report_path:
+                    import json
+                    with open(repair_report_path, "w") as report_file:
+                        json.dump(rejected, report_file, indent=2)
+                raise RepairRejected('Game optimization exceeds the export budget', rejected)
+            try:
+                game_validation = validate_repair(
+                    repair_reference_vertices, repair_reference_faces, vertices, faces)
+            except RepairRejected as exc:
+                exc.report.update(stage="final-game-validation", **counts)
+                if repair_report_path:
+                    import json
+                    with open(repair_report_path, "w") as report_file:
+                        json.dump(exc.report, report_file, indent=2)
+                raise
+            game_validation.update(stage="final-game-validation", **counts)
+            repair_stats = {**(repair_stats or {}), "game_validation": game_validation}
+            if experimental_retopo:
+                experimental_report_stats = {**(experimental_report_stats or {}),
+                                             "game_validation": game_validation}
+            if repair_report_path:
+                import json
+                with open(repair_report_path, "w") as report_file:
+                    json.dump(repair_stats, report_file, indent=2)
         if use_vertex_color and not with_texture_baking:
             nearest = cKDTree(mesh.vertices.float().cpu().numpy()).query(vertices, workers=2)[1]
             vert_colors = mesh.vertex_attrs[:, :3].cpu().numpy()[nearest]

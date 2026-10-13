@@ -31,3 +31,14 @@ def test_export_settings_allow_legacy_texture_and_repair_disable(monkeypatch):
 def test_porous_surface_repair_is_explicitly_opt_in(monkeypatch):
     monkeypatch.setenv('SAM3D_REPAIR_FORCE','1')
     assert ply2glb.export_settings()['repair_force'] is True
+
+
+def test_protected_detail_profile_is_explicit_and_invalid_profile_rejected(monkeypatch):
+    import pytest
+    monkeypatch.delenv('SAM3D_REPAIR_PROFILE',raising=False)
+    assert ply2glb.export_settings()['repair_profile']=='surface'
+    monkeypatch.setenv('SAM3D_REPAIR_PROFILE','protected-detail')
+    assert ply2glb.export_settings()['repair_profile']=='protected-detail'
+    monkeypatch.setenv('SAM3D_REPAIR_PROFILE','silently-corrupt')
+    with pytest.raises(ValueError,match='PROFILE'):
+        ply2glb.export_settings()
