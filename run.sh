@@ -105,11 +105,24 @@ wait_for_memory() {
     done
 }
 
+# Optional experimental learned rig. It runs after the converter has exited,
+# in its own bounded process. Missing/failed rigs keep the completed static GLB.
+run_rig_stage() {
+    local objdir="$1"
+    [[ -f "$objdir/mesh.glb" ]] || return 0
+    echo "  Learned rig stage (${SAM3D_RIG_MODE:-auto}): $objdir"
+    "$PY" "$SCRIPT_DIR/tools/auto_rig.py" "$objdir" \
+        --mode "${SAM3D_RIG_MODE:-auto}" || \
+        echo "  Rig stage could not start; static mesh.glb is retained."
+}
+
 # --- glb: re-convert an existing splat -----------------------------------------
 if [[ "$1" == "glb" ]]; then
     check_models
     wait_for_memory 12
-    exec "$PY" "$SCRIPT_DIR/ply2glb.py" "${2:-}"
+    "$PY" "$SCRIPT_DIR/ply2glb.py" "${2:-}"
+    run_rig_stage "${2:-}"
+    exit 0
 fi
 
 # Only "", "full" run the full flow; anything else is a mistake — show usage.
@@ -159,6 +172,7 @@ run_conversion() {
     set -e
     if (( status == 0 )); then
         glb_successes=$((glb_successes + 1))
+        run_rig_stage "$label"
         return 0
     fi
     echo "  ⚠ GLB conversion failed for ${label} (exit ${status}) — continuing."
