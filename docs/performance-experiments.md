@@ -81,7 +81,8 @@ artifacts and checkpoints are preserved; generated evidence is ignored by Git.
 The certificate implementation passed independent review and focused tests for
 exact matching, modified geometry, invalid indices/values, immutable snapshots,
 GLB metadata exclusion, actual exporter roundtrip, winding and nonfinite UVs.
-The full worktree suite passed 105 tests with 10 skips. Active-checkout tests
-are rerun after integration.
+The full worktree suite passed 105 tests with 10 skips in the sandbox. Before workflow separation, the original combined checkout passed all 175 tests with device access
+(no skips). This qualifies the integrated code and its regression checks; it
+does not constitute a matched end-to-end performance measurement.
 A matched full upstream-to-current generation/export run remains outstanding;
 previous roughly 4x end-to-end estimates should not be presented as measurements.
