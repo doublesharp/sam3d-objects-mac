@@ -5,6 +5,7 @@ import torch
 from pathlib import Path
 import os
 import re
+import zipfile
 from loguru import logger
 from lightning.pytorch.utilities.consolidate_checkpoint import (
     _format_checkpoint,
@@ -154,13 +155,20 @@ def load_model_from_checkpoint(
     remove_name: Union[List[str], None] = None,
     state_dict_key: Union[None, str, Iterable[str]] = "state_dict",
     state_dict_fn: Optional[Callable[[Any], Any]] = None,
+    mmap: bool = True,
 ):
     logger.info(f"Loading checkpoint from {checkpoint_path}")
     if os.path.isfile(checkpoint_path):
+        # Map CPU checkpoint storage on demand instead of copying the entire
+        # file before prefix filtering. Legacy pickle checkpoints cannot be
+        # mapped, and non-CPU loads retain the existing eager path.
+        mapped = (mmap and (device is None or torch.device(device).type == "cpu")
+                  and zipfile.is_zipfile(checkpoint_path))
         checkpoint = torch.load(
             checkpoint_path,
             map_location=device,
             weights_only=False,
+            mmap=mapped,
         )
     elif os.path.isdir(checkpoint_path):  # sharded
         checkpoint = load_sharded_checkpoint(checkpoint_path, device=device)
