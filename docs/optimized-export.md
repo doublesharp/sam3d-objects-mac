@@ -67,6 +67,8 @@ Exterior checks use 26 source-only ray directions plus convex-hull extrema. This
 
 Existing `mesh.glb` is still reused by default. Back it up and set `SAM3D_GAME_REBUILD_SOURCE_GLB=1` when deliberately rebuilding that source. The body profile runs once on the detailed source; game fitting reuses the strict closed surface with standard checks. Game cleanup also checks intersections, source fidelity and its budget, and regenerates matching normals and triangular fallback sidecars after local geometry changes.
 
+Crab rig inference accepts triangle faces: `infer_rig(points, faces)`. This finds connected distal limbs and solves smooth attachment weights on welded geometry, including UV seams. The point-only API remains available with approximate hard attachments. Inference estimates editable chains; it does not add anatomical legs missing from the source. The corrected crab export was audited at 121 keyframe/midpoint samples with unchanged mesh and texture payloads: no flipped triangles or edges stretched more than twice their rest length.
+
 ## Measurements on M2 Max
 
 The same crab image, mask, seed 9, and 10 diffusion steps per stage took 1151.3 seconds in the earlier local run and 240.49 seconds after optimization, a 4.79× generation speedup. Voxel coordinates, latent features, and all 778,304 Gaussian properties were bitwise identical. This comparison covers image-to-splat generation, including model loading, not a claim about every stage or every input.

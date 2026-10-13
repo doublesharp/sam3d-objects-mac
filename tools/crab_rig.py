@@ -1,7 +1,8 @@
 """Approximate automatic crab rig inferred from y-up reconstruction geometry.
 
 This is a procedural first pass, not anatomical reconstruction. It estimates
-six leg chains and two claws and exports an editable glTF skin and walk cycle.
+up to six leg chains and two claws and exports an editable glTF skin and walk cycle.
+Pass triangle faces to infer_rig for continuous mesh attachment weights.
 """
 import json
 import struct
@@ -9,12 +10,110 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
+from scipy import sparse
+from scipy.sparse.csgraph import connected_components
+from scipy.sparse.linalg import spsolve
 
 
-def infer_rig(points):
+def _connected_limbs(points, candidates, seed_cut, bottom_cut, faces=None):
+    """Find whole distal limbs before assigning a chain, rather than z slices."""
+    seeds = np.flatnonzero(candidates & (points[:, 1] < seed_cut))
+    if len(seeds) < 6:
+        return []
+    if faces is None:
+        tree = cKDTree(points[seeds])
+        distances, _ = tree.query(points[seeds], k=min(5, len(seeds)))
+        radius = max(float(np.median(distances[:, -1])) * 1.7, 1e-6)
+        edges = tree.query_pairs(radius, output_type='ndarray')
+    else:
+        lookup = np.full(len(points), -1, dtype=int)
+        lookup[seeds] = np.arange(len(seeds))
+        edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+        edges = lookup[edges]
+        edges = edges[(edges >= 0).all(axis=1)]
+    graph = sparse.coo_matrix((np.ones(2*len(edges)),
+                              (np.r_[edges[:, 0], edges[:, 1]],
+                               np.r_[edges[:, 1], edges[:, 0]])),
+                             shape=(len(seeds), len(seeds))).tocsr()
+    _, labels = connected_components(graph)
+    regions = []
+    for label in np.unique(labels):
+        region = seeds[labels == label]
+        if len(region) >= 3 and points[region, 1].min() < bottom_cut:
+            regions.append(region)
+    # Keep the supported maximum of three chains per side. Empty chains remain
+    # editable, but are never allowed to bisect a detected connected limb.
+    regions = sorted(regions, key=len, reverse=True)[:3]
+    return sorted(regions, key=lambda region: float(points[region, 2].mean()))
+
+
+def _smooth_mesh_weights(points, faces, rig, limb_seeds, ycut, width, zfront):
+    """Harmonic attachment weights on welded geometry, including UV seams."""
+    joints = np.asarray(rig['joint_indices'])
+    weights = np.asarray(rig['weights'])
+    dense = np.zeros((len(points), len(rig['bones'])))
+    np.add.at(dense, (np.arange(len(points))[:, None], joints), weights)
+    pinned = (points[:, 1] >= ycut+.04*width) | ((np.abs(points[:, 0]) < width*.45) & (points[:, 2] < zfront-.10*width))
+    dense[pinned] = 0
+    dense[pinned, 0] = 1
+    for region in limb_seeds:
+        pinned[region] = True
+    claw_seeds = (points[:, 1] < ycut-.06*width) & (points[:, 2] > zfront+.12*width)
+    pinned[claw_seeds] = True
+    for side, joint in ((-1, 13), (1, 14)):
+        mask = claw_seeds & (points[:, 0]*side > 0)
+        dense[mask] = 0
+        dense[mask, joint] = 1
+    # The cotangent energy respects triangle shape. Inverse edge lengths alone
+    # let a nearly collinear triangle's middle vertex receive a nonlinear weight
+    # and turn over during an otherwise mild bend. Clamp negative conductance to
+    # retain nonnegative harmonic weights on obtuse reconstruction triangles.
+    corners = points[faces]
+    area2 = np.linalg.norm(np.cross(corners[:, 1]-corners[:, 0], corners[:, 2]-corners[:, 0]), axis=1)
+    edge_sets = []
+    cotangents = []
+    for corner, a, b in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
+        edge_sets.append(np.sort(faces[:, [a, b]], axis=1))
+        cotangents.append(np.einsum('ij,ij->i', corners[:, a]-corners[:, corner], corners[:, b]-corners[:, corner])/np.maximum(area2, width**2*1e-12))
+    edges, mapping = np.unique(np.vstack(edge_sets), axis=0, return_inverse=True)
+    conductance = np.zeros(len(edges))
+    np.add.at(conductance, mapping, np.concatenate(cotangents))
+    conductance = np.maximum(conductance, 1e-8)
+    graph = sparse.coo_matrix((np.r_[conductance, conductance],
+                              (np.r_[edges[:, 0], edges[:, 1]], np.r_[edges[:, 1], edges[:, 0]])),
+                             shape=(len(points), len(points))).tocsr()
+    _, components = connected_components(graph)
+    for component in np.unique(components):
+        selected = components == component
+        if not pinned[selected].any():
+            pinned[selected] = True
+            dense[selected] = 0
+            dense[selected, 0] = 1
+    free = np.flatnonzero(~pinned)
+    fixed = np.flatnonzero(pinned)
+    if len(free):
+        laplacian = sparse.diags(np.asarray(graph.sum(axis=1)).ravel())-graph
+        dense[free] = spsolve(laplacian[free][:, free].tocsc(), -(laplacian[free][:, fixed] @ dense[fixed]))
+    dense = np.maximum(dense, 0)
+    indices = np.argsort(-dense, axis=1, kind='stable')[:, :4]
+    weights = np.take_along_axis(dense, indices, axis=1)
+    weights /= weights.sum(axis=1, keepdims=True)
+    indices[weights == 0] = 0
+    rig['joint_indices'] = indices.tolist()
+    rig['weights'] = weights.tolist()
+
+
+def infer_rig(points, faces=None):
     points=np.asarray(points,dtype=float)
     if points.ndim!=2 or points.shape[1]!=3 or not len(points) or not np.isfinite(points).all():
         raise ValueError('Expected finite, nonempty [N,3] y-up points')
+    if faces is not None:
+        faces = np.asarray(faces, dtype=int)
+        if faces.ndim != 2 or faces.shape[1] != 3 or (faces < 0).any() or (faces >= len(points)).any():
+            raise ValueError('Expected valid [F,3] triangle indices')
+        # Coincident UV-split vertices must share the same deformation.
+        points, unmap = np.unique(points, axis=0, return_inverse=True)
+        faces = unmap[faces]
     lo,hi=points.min(0),points.max(0)
     width=max(abs(lo[0]),abs(hi[0]),1e-3)
     ycut=lo[1]+.34*(hi[1]-lo[1])
@@ -24,15 +123,27 @@ def infer_rig(points):
     weights=np.zeros((len(points),2));weights[:,0]=1
     lower=points[:,1]<ycut
     claws=lower&(points[:,2]>zfront)&(np.abs(points[:,0])<width*.82)
+    limb_seeds = []
     for side_index,side in enumerate((-1,1)):
         candidates=lower&(points[:,0]*side>width*.52)&~claws
         side_points=points[candidates]
         if len(side_points)<3:
             side_points=np.array([[side*width*.8,lo[1],z] for z in np.linspace(lo[2],zfront,3)])
+        regions = _connected_limbs(points, candidates,
+                                   lo[1]+.27*(hi[1]-lo[1]),
+                                   lo[1]+.12*(hi[1]-lo[1]), faces)
         cuts=np.quantile(side_points[:,2],[1/3,2/3])
         bands=np.digitize(points[:,2],cuts)
+        if regions:
+            seed_points = np.concatenate(regions)
+            seed_bands = np.concatenate([np.full(len(region), band) for band, region in enumerate(regions)])
+            _, nearest = cKDTree(points[seed_points]).query(points)
+            bands = seed_bands[nearest]
+            limb_seeds.extend(regions)
         for band in range(3):
             selection=candidates&(bands==band)
+            if regions and band >= len(regions):
+                selection[:] = False
             cloud=points[selection]
             if len(cloud):
                 z=float(np.median(cloud[:,2]))
@@ -57,7 +168,13 @@ def infer_rig(points):
         joint=len(bones)
         bones.append({'name':'LeftClaw' if side<0 else 'RightClaw','parent':0,'position':[float(side*width*.38),float(ycut),float(zfront)],'kind':'claw','side':side})
         indices[selection]=[joint,0];weights[selection]=[1,0]
-    return {'bones':bones,'joint_indices':indices.tolist(),'weights':weights.tolist(),'duration':1.8,'method':'Approximate geometric leg/claw segmentation; walk in place'}
+    rig = {'bones':bones,'joint_indices':indices.tolist(),'weights':weights.tolist(),'duration':1.8,'method':'Connected distal limb segmentation; walk in place'}
+    if faces is not None:
+        _smooth_mesh_weights(points, faces, rig, limb_seeds, ycut, width, zfront)
+        rig['method'] = 'Connected distal limb segmentation with harmonic mesh attachment weights; walk in place'
+        rig['joint_indices'] = np.asarray(rig['joint_indices'])[unmap].tolist()
+        rig['weights'] = np.asarray(rig['weights'])[unmap].tolist()
+    return rig
 
 
 def walk_pose(rig,t):
@@ -151,8 +268,8 @@ def export_rigged_glb(source,destination,rig,rig_points):
         for primitive in document['meshes'][node['mesh']]['primitives']:
             points=accessor_array(document,binary,primitive['attributes']['POSITION'])
             _,nearest=tree.query(points,workers=2)
-            joint_array=np.zeros((len(points),4),dtype='<u2');joint_array[:,:2]=rig_indices[nearest]
-            weight_array=np.zeros((len(points),4),dtype='<f4');weight_array[:,:2]=rig_weights[nearest]
+            joint_array=np.zeros((len(points),4),dtype='<u2');joint_array[:,:rig_indices.shape[1]]=rig_indices[nearest]
+            weight_array=np.zeros((len(points),4),dtype='<f4');weight_array[:,:rig_weights.shape[1]]=rig_weights[nearest]
             joint_array[weight_array==0]=0
             primitive['attributes']['JOINTS_0']=append_accessor(joint_array,'VEC4',5123,34962)
             primitive['attributes']['WEIGHTS_0']=append_accessor(weight_array,'VEC4',5126,34962)
