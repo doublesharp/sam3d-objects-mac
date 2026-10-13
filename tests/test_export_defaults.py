@@ -1,4 +1,51 @@
 import ply2glb
+import pytest
+
+
+def test_texture_profiles_use_2k_preview_and_4k_final(monkeypatch):
+    monkeypatch.delenv('SAM3D_TEXTURE_SIZE', raising=False)
+    assert ply2glb.texture_size_for_profile('preview') == 2048
+    assert ply2glb.texture_size_for_profile('final') == 4096
+
+
+def test_explicit_texture_size_overrides_profile(monkeypatch):
+    monkeypatch.setenv('SAM3D_TEXTURE_SIZE', '8192')
+    assert ply2glb.texture_size_for_profile('preview') == 8192
+    assert ply2glb.texture_size_for_profile('final') == 8192
+
+
+@pytest.mark.parametrize('size', ['not-an-int', '0', '-1', '16384'])
+def test_invalid_texture_size_is_rejected(monkeypatch, size):
+    monkeypatch.setenv('SAM3D_TEXTURE_SIZE', size)
+    with pytest.raises(ValueError, match='TEXTURE_SIZE'):
+        ply2glb.texture_size_for_profile('final')
+
+
+def test_invalid_texture_profile_is_rejected(monkeypatch):
+    monkeypatch.delenv('SAM3D_TEXTURE_SIZE', raising=False)
+    with pytest.raises(ValueError, match='TEXTURE_PROFILE'):
+        ply2glb.texture_size_for_profile('unknown')
+
+
+def test_texture_profile_cli_defaults_to_final_and_accepts_preview(monkeypatch):
+    monkeypatch.delenv('SAM3D_TEXTURE_PROFILE', raising=False)
+    monkeypatch.setattr('sys.argv', ['ply2glb.py', '/tmp/source'])
+    assert ply2glb.parse_args().texture_profile == 'final'
+    monkeypatch.setattr('sys.argv', ['ply2glb.py', '/tmp/source', '--texture-profile', 'preview'])
+    assert ply2glb.parse_args().texture_profile == 'preview'
+
+
+def test_texture_profile_environment_applies_to_cli(monkeypatch):
+    monkeypatch.setenv('SAM3D_TEXTURE_PROFILE', 'preview')
+    monkeypatch.setattr('sys.argv', ['ply2glb.py', '/tmp/source'])
+    assert ply2glb.parse_args().texture_profile == 'preview'
+
+
+def test_invalid_texture_size_fails_before_loading_source(monkeypatch):
+    monkeypatch.setenv('SAM3D_TEXTURE_SIZE', 'not-an-int')
+    monkeypatch.setattr('sys.argv', ['ply2glb.py', '/missing/source'])
+    with pytest.raises(ValueError, match='TEXTURE_SIZE'):
+        ply2glb.main()
 
 
 def test_mps_auto_decode_uses_verified_cpu_path(monkeypatch):

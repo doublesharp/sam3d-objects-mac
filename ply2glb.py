@@ -51,6 +51,22 @@ def bool_env(name, default=True):
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+def texture_size_for_profile(profile):
+    defaults = {'preview': 2048, 'final': 4096}
+    if profile not in defaults:
+        raise ValueError('SAM3D_TEXTURE_PROFILE must be preview or final')
+    raw = os.environ.get('SAM3D_TEXTURE_SIZE')
+    if raw is None:
+        return defaults[profile]
+    try:
+        size = int(raw)
+    except ValueError as exc:
+        raise ValueError('SAM3D_TEXTURE_SIZE must be an integer from 64 through 8192') from exc
+    if not 64 <= size <= 8192:
+        raise ValueError('SAM3D_TEXTURE_SIZE must be an integer from 64 through 8192')
+    return size
+
+
 def choose_mesh_decode_device(render_device, active_voxels):
     requested = os.environ.get("SAM3D_MESH_DECODE_DEVICE", "auto").strip().lower()
     if requested in ("cpu", "mps", "cuda"):
@@ -118,6 +134,11 @@ def parse_args():
         "folder",
         nargs="?",
         help="Output folder containing splat.ply and slat.pt",
+    )
+    parser.add_argument(
+        '--texture-profile', choices=('preview', 'final'),
+        default=os.environ.get('SAM3D_TEXTURE_PROFILE', 'final'),
+        help='Texture atlas: preview=2K, final=4K (default); SAM3D_TEXTURE_SIZE overrides it',
     )
     parser.add_argument(
         "--target-faces",
@@ -359,6 +380,7 @@ def finish_source_only(folder, source_path, output_name, progress=None):
 def main():
     print(f"\n{BOLD}{W}  ply2glb  ·  Gaussian splat → Textured GLB{RST}")
     args = parse_args()
+    texture_size = texture_size_for_profile(getattr(args, 'texture_profile', 'final'))
 
     if not args.folder:
         print(
@@ -467,7 +489,6 @@ def main():
     settings = export_settings()
     texture_views = int_env("SAM3D_TEXTURE_VIEWS", 100)
     texture_render_resolution = int_env("SAM3D_TEXTURE_RENDER_RES", 1024)
-    texture_size = int_env("SAM3D_TEXTURE_SIZE", 2048)
     game_temp_dir = tempfile.mkdtemp(prefix=".mesh-game-", dir=folder)
     game_quad_path = None
     game_normal_path = None

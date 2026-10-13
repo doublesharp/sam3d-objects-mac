@@ -208,8 +208,11 @@ def bake_gaussian_color_texture(
     splat_scales: np.ndarray,
     splat_rotations: np.ndarray,
     texture_size: int = 1024,
+    workers: int = -1,
 ):
     """Bake continuous color from local Gaussian neighborhoods after retopology."""
+    if not isinstance(workers, int) or (workers != -1 and workers < 1):
+        raise ValueError("workers must be a positive integer or -1")
     size = max(64, int(texture_size))
     vertices = np.asarray(vertices, dtype=np.float32)
     faces = np.asarray(faces, dtype=np.int64)
@@ -248,7 +251,7 @@ def bake_gaussian_color_texture(
         stop = min(covered.shape[0], start + chunk_size)
         query = positions[covered[start:stop]]
         query_normals = low_normals[covered[start:stop]]
-        distances, indices = tree.query(query, k=neighbors, workers=-1)
+        distances, indices = tree.query(query, k=neighbors, workers=workers)
         if neighbors == 1:
             distances = distances[:, None]
             indices = indices[:, None]
