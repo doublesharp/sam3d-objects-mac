@@ -16,6 +16,11 @@ repair safeguards, and M2 Max timings,
 New finished exports use 4K textures; previews can use 2K. See
 [texture rebaking](docs/texture-rebake.md) for saved models.
 
+The optional
+[learned rig stage](docs/rigging.md) runs after export and creates an editable
+rig candidate with joint overrides. Anatomical and motion quality still need
+review for each model.
+
 `feature/mps-performance` holds generic SAM generation, repair, export, and
 performance improvements. Custom viewers, rigging workflows, third-party model
 adapters, and project-specific experiments belong on
