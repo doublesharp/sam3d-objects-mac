@@ -24,7 +24,7 @@ def test_failures_continue_and_preserve_environment(tmp_path,overlap):
     import batch_scheduler as scheduler
     result = tmp_path/'✓ space.json'
     jobs=[{'name':'failed generation','generate':[sys.executable,'-c','raise SystemExit(7)'],'export':[sys.executable,'-c','raise SystemExit(99)']}, {'name':'export fails','generate':[sys.executable,'-c','pass'],'export':[sys.executable,'-c','raise SystemExit(8)']}, {'name':'good','generate':[sys.executable,'-c','pass'],'export':[sys.executable,'-c',"import os,json,sys; json.dump(dict(os.environ),open(sys.argv[1],'w'))",str(result)]}]
-    records=scheduler.run_batch(jobs,overlap=overlap,env={**os.environ,'SAM3D_SOURCE_ONLY':'1','SAM3D_REPAIR_PROFILE':'final'})
+    records=scheduler.run_batch(jobs,overlap=overlap,env={**os.environ,'SAM3D_SOURCE_ONLY':'1','SAM3D_REPAIR_PROFILE':'final','OMP_NUM_THREADS':'2','SAM3D_EXPORT_THREADS':'2'})
     assert [(r['generation'],r['export']) for r in records]==[(7,None),(0,8),(0,0)]
     env=json.loads(result.read_text()); assert env['SAM3D_SOURCE_ONLY']=='1'; assert env.get('SAM3D_EXPORT_DEVICE') == ('cpu' if overlap else os.environ.get('SAM3D_EXPORT_DEVICE')); assert env['OMP_NUM_THREADS']=='2'
 
@@ -221,3 +221,17 @@ def test_repair_enabled_matches_exporter_boolean_semantics(raw, monkeypatch):
     monkeypatch.setenv('SAM3D_SURFACE_REPAIR',raw)
     assert ply2glb.bool_env('SAM3D_SURFACE_REPAIR',True)
     assert scheduler.overlap_eligible({'SAM3D_SURFACE_REPAIR':raw},memory=(128*2**30,80*2**30))
+
+
+def test_overlap_honors_explicit_cpu_export_budgets():
+    import batch_scheduler as scheduler
+    original = {"SAM3D_EXPORT_THREADS": "8", "SAM3D_EXPORT_INTEROP_THREADS": "2",
+                "SAM3D_GAUSSIAN_KD_WORKERS": "4", "OMP_NUM_THREADS": "1"}
+    result = scheduler.cpu_export_env(original)
+    for name in ["SAM3D_EXPORT_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                 "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"]:
+        assert result[name] == "8"
+    assert result["SAM3D_EXPORT_INTEROP_THREADS"] == "2"
+    assert result["SAM3D_GAUSSIAN_KD_WORKERS"] == "4"
+    assert original["OMP_NUM_THREADS"] == "1"
+    assert "OPENBLAS_NUM_THREADS" not in original

@@ -34,10 +34,13 @@ def overlap_eligible(env=None, memory=None):
 
 def cpu_export_env(env):
     result = dict(env)
+    threads = env.get('SAM3D_EXPORT_THREADS', '2')
     result.update(SAM3D_EXPORT_DEVICE='cpu', SAM3D_MESH_DECODE_DEVICE='cpu',
-                  SAM3D_EXPORT_THREADS='2', SAM3D_EXPORT_INTEROP_THREADS='1',
-                  SAM3D_GAUSSIAN_KD_WORKERS='2', OMP_NUM_THREADS='2',
-                  OPENBLAS_NUM_THREADS='2', MKL_NUM_THREADS='2', VECLIB_MAXIMUM_THREADS='2')
+                  SAM3D_EXPORT_THREADS=threads,
+                  SAM3D_EXPORT_INTEROP_THREADS=env.get('SAM3D_EXPORT_INTEROP_THREADS', '1'),
+                  SAM3D_GAUSSIAN_KD_WORKERS=env.get('SAM3D_GAUSSIAN_KD_WORKERS', '2'),
+                  OMP_NUM_THREADS=threads, OPENBLAS_NUM_THREADS=threads,
+                  MKL_NUM_THREADS=threads, VECLIB_MAXIMUM_THREADS=threads)
     return result
 
 

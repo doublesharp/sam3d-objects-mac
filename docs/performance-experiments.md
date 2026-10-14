@@ -50,11 +50,17 @@ unchanged: it generates splats and latents without export. Other texture modes
 retain the serial flow and their existing device settings.
 
 Overlapping export forces `SAM3D_EXPORT_DEVICE=cpu` and
-`SAM3D_MESH_DECODE_DEVICE=cpu`. It uses two PyTorch and BLAS threads, one PyTorch
-interop thread, and two Gaussian KD-tree workers. Standalone export retains its
-normal resource defaults; optional `SAM3D_EXPORT_THREADS`,
-`SAM3D_EXPORT_INTEROP_THREADS`, and `SAM3D_GAUSSIAN_KD_WORKERS` expose those budgets.
-The thread settings require positive integers; KD workers also accepts `-1`.
+`SAM3D_MESH_DECODE_DEVICE=cpu`. It defaults to two PyTorch and BLAS threads, one
+PyTorch interop thread, and two Gaussian KD-tree workers. Explicit
+`SAM3D_EXPORT_THREADS`, `SAM3D_EXPORT_INTEROP_THREADS`, and
+`SAM3D_GAUSSIAN_KD_WORKERS` are honored during overlap as well as standalone
+export. During overlap, the exporter thread budget also configures its BLAS and
+OpenMP pools. The generation child's environment is preserved.
+
+For example, `SAM3D_EXPORT_THREADS=4 ./run.sh` selects four exporter threads.
+Measure both standalone and overlapping runs when choosing a budget. More
+threads can compete with generation and do not guarantee faster batches. The
+thread settings require positive integers; KD workers also accepts `-1`.
 Normal repair-distance threads retain their existing budget.
 
 Profiles, source-only/complete output, texture settings and game targets are
