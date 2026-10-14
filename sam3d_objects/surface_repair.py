@@ -48,6 +48,22 @@ def topology(vertices, faces):
                 euler_number=int(mesh.euler_number), bounds=mesh.bounds.tolist())
 
 
+def geometry_report(vertices, faces):
+    """Check the embedded surface, including intersections missed by edge counts."""
+    import open3d as o3d
+    vertices, faces = _arrays(vertices, faces)
+    mesh = _mesh(vertices, faces)
+    geometry = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(mesh.vertices),
+                                       o3d.utility.Vector3iVector(mesh.faces))
+    edge_closed = geometry.is_edge_manifold(allow_boundary_edges=False)
+    vertex_manifold = geometry.is_vertex_manifold()
+    orientable = geometry.is_orientable()
+    intersections = geometry.get_self_intersecting_triangles()
+    return dict(edge_closed=bool(edge_closed), vertex_manifold=bool(vertex_manifold),
+                orientable=bool(orientable), self_intersection_pairs=len(intersections),
+                strict_watertight=bool(edge_closed and vertex_manifold and not len(intersections)))
+
+
 def _scene(vertices, faces):
     import open3d as o3d
     mesh = o3d.t.geometry.TriangleMesh(
@@ -75,6 +91,10 @@ def validate_repair(source_vertices, source_faces, vertices, faces,
     report = {'after': after, 'status': 'rejected'}
     if not after['watertight'] or not after['winding_consistent'] or after['nonmanifold_edges']:
         raise RepairRejected('Repair rejected: surface is not closed and manifold', report)
+    geometry = geometry_report(vertices, faces)
+    report['geometry'] = geometry
+    if not geometry['strict_watertight'] or not geometry['orientable']:
+        raise RepairRejected('Repair rejected: vertex defects or self-intersections remain', report)
     scale = max(float(np.linalg.norm(np.ptp(source_vertices, axis=0))), 1e-8)
     extents = np.maximum(np.ptp(source_vertices, axis=0), scale*1e-5)
     retention = np.ptp(vertices, axis=0)/extents
@@ -102,6 +122,39 @@ def validate_repair(source_vertices, source_faces, vertices, faces,
     report['status'] = 'repaired'
     return report
 
+
+
+def repair_game_surface(source_vertices, source_faces, vertices, faces,
+                        max_faces=20000, max_vertices=10000):
+    """Local cleanup of a bounded game candidate; never rebuild its body."""
+    vertices,faces=_arrays(vertices,faces)
+    if len(faces)>max(2*int(max_faces),100):
+        raise RepairRejected('Game cleanup exceeds its bounded input budget',{'status':'rejected'})
+    import pymeshfix
+    for attempt in range(2):
+        # MeshFix emits rounded coordinates. Weld coincidences in the actual
+        # float32 export representation before another bounded cleanup pass.
+        welded=_mesh(vertices,faces)
+        welded.update_faces(welded.nondegenerate_faces())
+        welded.update_faces(welded.unique_faces())
+        welded.remove_unreferenced_vertices()
+        fix=pymeshfix.MeshFix(welded.vertices,welded.faces)
+        fix.repair(joincomp=False,remove_smallest_components=False)
+        mesh=trimesh.Trimesh(np.asarray(fix.points),np.asarray(fix.faces),process=False)
+        mesh.fix_normals(multibody=True)
+        vertices=np.asarray(mesh.vertices,dtype=np.float32);faces=np.asarray(mesh.faces,dtype=np.int64)
+        mesh, closed_loops = close_small_boundaries(_mesh(vertices,faces))
+        mesh.fix_normals(multibody=True)
+        vertices=np.asarray(mesh.vertices,dtype=np.float32);faces=np.asarray(mesh.faces,dtype=np.int64)
+        check=geometry_report(vertices,faces)
+        if check['strict_watertight'] and check['orientable']:
+            break
+    if len(faces)>int(max_faces) or len(vertices)>int(max_vertices):
+        raise RepairRejected('Game cleanup exceeds the export budget',
+                             {'status':'rejected','triangles':len(faces),'vertices':len(vertices)})
+    report=validate_repair(source_vertices,source_faces,vertices,faces)
+    report.update(stage='bounded-game-intersection-cleanup',target_faces=int(max_faces),target_vertices=int(max_vertices),closed_boundary_loops=int(closed_loops))
+    return RepairResult(vertices,faces,report)
 
 def close_small_boundaries(mesh):
     """Cap only small simple loops; never guess a large missing surface."""
@@ -157,6 +210,13 @@ def choose_repair_settings(vertices):
     return (224,2) if thin_ratio<.5 else (192,4)
 
 
+def repair_profile_setting(value):
+    profile=str(value or 'surface').strip().lower()
+    if profile not in ('surface','protected-detail'):
+        raise ValueError('SAM3D_REPAIR_PROFILE must be surface or protected-detail')
+    return profile
+
+
 def optional_repair_setting(value):
     return None if value is None or str(value).lower()=="auto" else int(value)
 
@@ -167,8 +227,11 @@ def repair_surface(vertices, faces, resolution=None, closing_radius=None, force=
     vertices, faces = _arrays(vertices, faces)
     before = topology(vertices, faces)
     if not force and before['watertight'] and before['winding_consistent'] and not before['nonmanifold_edges']:
-        return RepairResult(vertices.copy(), faces.copy(),
-                            {'status':'unchanged','before':before,'after':before,'seconds':time.perf_counter()-started})
+        geometry = geometry_report(vertices, faces)
+        if geometry['strict_watertight'] and geometry['orientable']:
+            return RepairResult(vertices.copy(), faces.copy(),
+                                {'status':'unchanged','before':before,'after':before,
+                                 'geometry':geometry,'seconds':time.perf_counter()-started})
     auto_resolution, auto_radius=choose_repair_settings(vertices)
     resolution=auto_resolution if resolution is None else resolution
     closing_radius=auto_radius if closing_radius is None else closing_radius

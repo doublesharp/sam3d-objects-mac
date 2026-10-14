@@ -67,11 +67,11 @@ def choose_mesh_decode_device(render_device, active_voxels):
 
 
 def export_settings():
-    from sam3d_objects.surface_repair import optional_repair_setting
+    from sam3d_objects.surface_repair import optional_repair_setting, repair_profile_setting
     mode=os.environ.get("SAM3D_TEXTURE_MODE", "gaussian").strip().lower()
     if mode not in ("gaussian", "average", "opt", "fast"):
         raise ValueError("SAM3D_TEXTURE_MODE must be gaussian, average, opt, or fast")
-    return dict(texture_mode=mode, surface_repair=bool_env("SAM3D_SURFACE_REPAIR", True),
+    return dict(texture_mode=mode, repair_profile=repair_profile_setting(os.environ.get("SAM3D_REPAIR_PROFILE")), surface_repair=bool_env("SAM3D_SURFACE_REPAIR", True),
                 repair_force=bool_env("SAM3D_REPAIR_FORCE", False),
                 repair_resolution=optional_repair_setting(os.environ.get("SAM3D_REPAIR_RESOLUTION")),
                 repair_closing_radius=optional_repair_setting(os.environ.get("SAM3D_REPAIR_RADIUS")))
@@ -322,6 +322,40 @@ def auto_game_target_faces(source_glb_path, target_vertices):
     return int(max(4000, min(20000, target_vertices * 2)))
 
 
+
+def finish_source_only(folder, source_path, output_name, progress=None):
+    """Validate and export the detailed artifact without fitting or rebaking a LOD."""
+    import json
+    import trimesh
+    from sam3d_objects.surface_repair import geometry_report, topology, RepairRejected
+    scene=trimesh.load(source_path,force='scene',process=False)
+    checks=[]
+    for mesh in scene.geometry.values():
+        geometry=geometry_report(mesh.vertices,mesh.faces)
+        geometry['winding_consistent']=topology(mesh.vertices,mesh.faces)['winding_consistent']
+        uv=getattr(mesh.visual,'uv',None)
+        if not geometry['strict_watertight'] or not geometry['orientable'] or not geometry['winding_consistent'] or (uv is not None and not np.isfinite(uv).all()):
+            raise RepairRejected('Detailed source is not strictly valid; rebuild it before reusing',
+                                 {'status':'rejected','geometry':geometry})
+        checks.append(geometry)
+    if not checks:
+        raise RepairRejected('Detailed source contains no geometry',{'status':'rejected'})
+    paths=export_glb_to_obj_family(source_path,folder,'mesh')
+    output_path=os.path.join(folder,output_name)
+    if os.path.abspath(output_path)!=os.path.abspath(source_path):
+        shutil.copy2(source_path,output_path)
+    report={'status':'detailed_complete','source':os.path.basename(source_path),
+            'output':output_name,'geometry':checks,'game':{'status':'not_requested'}}
+    with open(os.path.join(folder,'export-status.json'),'w') as f:
+        json.dump(report,f,indent=2)
+    if progress is not None:
+        if bool_env('SAM3D_PROGRESS_FINISH',True):progress.finish('Detailed complete')
+        else:progress.close()
+    saved(output_name,output_path)
+    for name,path in zip(('mesh.obj','mesh.mtl','mesh_texture.png'),paths):saved(name,path)
+    hdr('DETAILED EXPORT DONE')
+    return report
+
 def main():
     print(f"\n{BOLD}{W}  ply2glb  ·  Gaussian splat → Textured GLB{RST}")
     args = parse_args()
@@ -337,20 +371,22 @@ def main():
     slat_path = os.path.join(folder, "slat.pt")
     game_sidecar_base = "mesh_game"
     source_glb_path = os.path.join(folder, "mesh.glb")
-    default_name = "mesh_game.glb"
+    source_only = bool_env("SAM3D_SOURCE_ONLY",False)
+    default_name = "mesh.glb" if source_only else "mesh_game.glb"
     out_name = args.output or default_name
     glb_path  = os.path.join(folder, out_name)
     target_vertices = parse_target_vertices(args.target_vertices)
     target_faces = auto_game_target_faces(source_glb_path, target_vertices)
-
-    if not os.path.isfile(ply_path):
-        err(f"splat.ply not found in {folder}")
 
     rebuild_source_glb = bool_env("SAM3D_GAME_REBUILD_SOURCE_GLB", False)
     source_glb_valid = validate_glb_mesh(source_glb_path)
     if os.path.isfile(source_glb_path) and not source_glb_valid:
         print(f"  {Y}⚠{RST}   Existing mesh.glb is not loadable; rebuilding it: {source_glb_path}")
     should_write_source_glb = rebuild_source_glb or not source_glb_valid
+    if source_only and not should_write_source_glb:
+        return finish_source_only(folder,source_glb_path,out_name)
+    if not os.path.isfile(ply_path):
+        err(f"splat.ply not found in {folder}")
     if should_write_source_glb and not os.path.isfile(slat_path):
         err(f"slat.pt not found in {folder} — re-run the CLI to regenerate (it now saves slat.pt)")
 
@@ -360,7 +396,7 @@ def main():
         else "cpu"
     )
     ok(f"Device: {render_device}")
-    ok("Pipeline: mesh.glb → mesh.obj → mesh_game.glb/.obj + texture/normal")
+    ok("Pipeline: detailed mesh.glb/.obj" if source_only else "Pipeline: mesh.glb → mesh.obj → mesh_game.glb/.obj + texture/normal")
     ok(f"Game vertex target: {target_vertices or 'auto (2k-10k)'}")
     progress = make_progress(
         extra_units=8 if should_write_source_glb else 2
@@ -498,6 +534,8 @@ def main():
             empty_device_cache(render_device)
         else:
             ok("Using existing mesh.glb as the high-detail comparison source")
+        if source_only:
+            return finish_source_only(folder,source_glb_path,out_name,progress)
         source_obj, source_mtl, source_texture = export_glb_to_obj_family(source_glb_path, folder, "mesh")
         saved("mesh.obj", source_obj)
         saved("mesh.mtl", source_mtl)
@@ -535,7 +573,7 @@ def main():
             experimental_quad_path=game_quad_path,
             experimental_normal_path=game_normal_path,
             experimental_source_is_clean=True,
-            **{**settings, "repair_force": False},
+            **{**settings, "repair_force": False, "repair_profile": "surface"},
             repair_report_path=os.path.join(folder, "mesh_game_repair_report.json"),
             with_mesh_postprocess=True,   # includes floater removal (remove_floaters default on)
             with_texture_baking=True,

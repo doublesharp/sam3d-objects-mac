@@ -165,3 +165,35 @@ def test_forced_repair_counts_interior_sealed_by_closing_itself():
     assert result.report['after']['watertight']
     assert result.report['after']['boundary_edges']==result.report['after']['nonmanifold_edges']==0
     assert result.report['surface_error_p95']<.035
+
+
+def test_closed_edges_do_not_allow_geometric_self_intersections():
+    first=trimesh.creation.box()
+    second=trimesh.creation.box();second.apply_translation([.4,.2,.1])
+    overlap=trimesh.util.concatenate([first,second])
+    assert overlap.is_watertight
+    with pytest.raises(RepairRejected,match='intersect'):
+        validate_repair(overlap.vertices,overlap.faces,overlap.vertices,overlap.faces)
+
+
+def test_unchanged_path_rejects_self_intersecting_closed_sources():
+    first=trimesh.creation.box()
+    second=trimesh.creation.box();second.apply_translation([.4,.2,.1])
+    overlap=trimesh.util.concatenate([first,second])
+    try:
+        result=repair_surface(overlap.vertices,overlap.faces,resolution=48,closing_radius=2)
+    except RepairRejected:
+        return
+    assert result.report['status'] != 'unchanged'
+    assert result.report['geometry']['strict_watertight']
+
+
+def test_game_cleanup_repairs_duplicate_surface_and_enforces_budget():
+    from sam3d_objects.surface_repair import repair_game_surface, geometry_report
+    source=trimesh.creation.icosphere(subdivisions=1)
+    duplicate=np.vstack([source.faces,source.faces[:1]])
+    result=repair_game_surface(source.vertices,source.faces,source.vertices,duplicate,max_faces=len(source.faces))
+    assert geometry_report(result.vertices,result.faces)['strict_watertight']
+    assert len(result.faces)<=len(source.faces)
+    with pytest.raises(RepairRejected,match='budget'):
+        repair_game_surface(source.vertices,source.faces,source.vertices,duplicate,max_faces=4)
