@@ -11,6 +11,7 @@ from .serialized_attn import (
 )
 from .windowed_attn import sparse_windowed_scaled_dot_product_self_attention
 from ...attention import RotaryPositionEmbedder
+from ...attention_cache import cache_slot
 
 
 class SparseMultiHeadRMSNorm(nn.Module):
@@ -127,6 +128,7 @@ class SparseMultiHeadAttention(nn.Module):
         x: Union[SparseTensor, torch.Tensor],
         context: Optional[Union[SparseTensor, torch.Tensor]] = None,
     ) -> Union[SparseTensor, torch.Tensor]:
+        slot = cache_slot(self, x, context, supported=not self.qk_rms_norm) if self._type == "cross" else None
         if self._type == "self":
             qkv = self._linear(self.to_qkv, x)
             qkv = self._fused_pre(qkv, num_fused=3)
@@ -154,8 +156,12 @@ class SparseMultiHeadAttention(nn.Module):
         else:
             q = self._linear(self.to_q, x)
             q = self._reshape_chs(q, (self.num_heads, -1))
-            kv = self._linear(self.to_kv, context)
-            kv = self._fused_pre(kv, num_fused=2)
+            kv = slot.get("kv") if slot is not None else None
+            if kv is None:
+                kv = self._linear(self.to_kv, context)
+                kv = self._fused_pre(kv, num_fused=2)
+                if slot is not None:
+                    slot["kv"] = kv
             if self.qk_rms_norm:
                 q = self.q_rms_norm(q)
                 k, v = kv.unbind(dim=1)

@@ -15,6 +15,15 @@ faces remain distinct. Finite geometry, indices, winding and UV checks still run
 Changed geometry and existing files use full validation. Certificates are not
 persisted or trusted from metadata.
 
+## Generation attention cache
+
+Eligible attention layers cache immutable conditioning K/V within one pipeline
+run. The cache never crosses runs and is bypassed for unsupported inputs.
+`SAM3D_ATTENTION_CACHE=0` disables it. Both conditioning branches reuse K/V
+only. Every query, attention operation and output projection runs afresh,
+including single-token conditioning and non-finite queries. These changes do not change sampler seeds, steps or generation
+profiles.
+
 ## Native CPU benchmarks
 
 The scripts in benchmarks/benchmark_native_indexing.py and

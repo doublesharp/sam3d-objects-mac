@@ -1,3 +1,4 @@
+from ..modules.attention_cache import conditioning_branch
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import *
 import torch
@@ -313,6 +314,7 @@ class SLatFlowModelTdfyWrapper(SLatFlowModel):
             self.condition_embedder = condition_embedder
         else:
             self.condition_embedder = lambda x: x
+        self._cache_preembedded_condition = condition_embedder is None
         self.force_zeros_cond = force_zeros_cond
         # self.null_condition = None
 
@@ -349,6 +351,12 @@ class SLatFlowModelTdfyWrapper(SLatFlowModel):
             cond = cond * 0
         else:
             cond = self.condition_embedder(*condition_args, **condition_kwargs)
-        h = super().forward(x, t, cond, d)
+        with conditioning_branch(
+            condition_args[0] if len(condition_args) == 1 else None,
+            zero=self.force_zeros_cond and cfg_activate,
+            supported=self._cache_preembedded_condition and not condition_kwargs
+            and (not cfg_activate or self.force_zeros_cond),
+        ):
+            h = super().forward(x, t, cond, d)
         h = h.feats[None]
         return h

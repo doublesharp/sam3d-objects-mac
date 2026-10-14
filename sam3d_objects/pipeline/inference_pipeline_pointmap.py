@@ -1,3 +1,4 @@
+from sam3d_objects.model.backbone.tdfy_dit.modules.attention_cache import cached_attention_run
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import Union, Optional
 from copy import deepcopy
@@ -426,6 +427,7 @@ class InferencePipelinePointMap(InferencePipeline):
             layout=slat.layout,
         )
 
+    @cached_attention_run
     def run(
         self,
         image: Union[None, Image.Image, np.ndarray],

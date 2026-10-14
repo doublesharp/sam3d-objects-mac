@@ -1,3 +1,4 @@
+from ..modules.attention_cache import conditioning_branch
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from functools import partial
 from typing import *
@@ -194,6 +195,7 @@ class SparseStructureFlowTdfyWrapper(SparseStructureFlowModel):
             self.condition_embedder = condition_embedder
         else:
             self.condition_embedder = lambda x: x
+        self._cache_preembedded_condition = condition_embedder is None
         self.force_zeros_cond = force_zeros_cond
         self.latent_mapping = nn.ModuleDict(latent_mapping)
         if not isinstance(latent_share_transformer, dict):
@@ -220,7 +222,13 @@ class SparseStructureFlowTdfyWrapper(SparseStructureFlowModel):
 
         # concatenate input
         latent_dict = self.project_input(latents_dict)
-        output = super().forward(latent_dict, t, cond, d)
+        with conditioning_branch(
+            condition_args[0] if len(condition_args) == 1 else None,
+            zero=self.force_zeros_cond and cfg_activate,
+            supported=self._cache_preembedded_condition and not condition_kwargs
+            and (not cfg_activate or self.force_zeros_cond),
+        ):
+            output = super().forward(latent_dict, t, cond, d)
 
         # split input to multiple output modalities
         output_latents = self.project_output(output)

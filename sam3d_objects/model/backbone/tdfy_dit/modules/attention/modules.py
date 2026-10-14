@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .full_attn import scaled_dot_product_attention
+from ..attention_cache import cache_slot
 from sam3d_objects.data.utils import (
     tree_reduce_unique,
 )
@@ -141,6 +142,7 @@ class MultiHeadAttention(nn.Module):
         context: Optional[torch.Tensor] = None,
         indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        slot = cache_slot(self, x, context) if self._type == "cross" else None
         B, L, C = x.shape
         if self._type == "self":
             qkv = self.to_qkv(x)
@@ -162,13 +164,20 @@ class MultiHeadAttention(nn.Module):
         else:
             Lkv = context.shape[1]
             q = self.to_q(x)
-            kv = self.to_kv(context)
+            kv = slot.get("kv") if slot is not None else None
+            if kv is None:
+                kv = self.to_kv(context)
+                if slot is not None:
+                    slot["kv"] = kv
             q = q.reshape(B, L, self.num_heads, -1)
             kv = kv.reshape(B, Lkv, 2, self.num_heads, -1)
             if self.qk_rms_norm:
                 q = self.q_rms_norm(q)
                 k, v = kv.unbind(dim=2)
-                k = self.k_rms_norm(k)
+                normalized = slot.get("normalized_k") if slot is not None else None
+                k = self.k_rms_norm(k) if normalized is None else normalized
+                if slot is not None:
+                    slot["normalized_k"] = k
                 h = scaled_dot_product_attention(q, k, v)
             else:
                 h = scaled_dot_product_attention(q, kv)
