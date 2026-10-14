@@ -252,3 +252,72 @@ def test_submanifold_preserves_duplicate_lookup_and_cache_kernel_invalidation(de
         prior_pairs = cache['entry'][3]
         _subm_forward(feats * 2, coords.clone(), weight, bias, neighbor_cache=cache)
         assert cache['entry'][3] is prior_pairs
+
+
+def test_submanifold_neighbor_maps_are_shared_across_layers(monkeypatch):
+    from sam3d_objects.model.backbone.tdfy_dit.modules.sparse.conv import conv_native
+    from sam3d_objects.model.backbone.tdfy_dit.modules.sparse import SparseTensor
+    coords = torch.tensor([[0, 0, 0, 0], [0, 0, 0, 1], [0, 1, 0, 0]], dtype=torch.int32)
+    feats = torch.randn(3, 2)
+    layers = [conv_native.SparseConv3d(2, 3, 3).eval() for _ in range(2)]
+    x = SparseTensor(feats, coords)
+    expected = [conv_native._subm_forward(feats * scale, x.coords.long(), layer.weight, layer.bias)
+                for layer, scale in zip(layers, [1, 2])]
+    builds = []
+    original = conv_native._CoordinateLookup
+    def lookup(indices):
+        builds.append(len(indices))
+        return original(indices)
+    monkeypatch.setattr(conv_native, '_CoordinateLookup', lookup)
+    with torch.no_grad():
+        for layer, scale, reference in zip(layers, [1, 2], expected):
+            actual = layer(x.replace(feats * scale))
+            torch.testing.assert_close(actual.feats, reference, rtol=0, atol=0)
+            assert actual._spatial_cache is x._spatial_cache
+    assert builds == [3], 'Layers sharing coordinates should build the neighbor map once'
+
+
+@pytest.mark.parametrize('inference', [False, True])
+def test_shared_neighbor_maps_validate_coordinate_changes_and_kernel(inference):
+    from sam3d_objects.model.backbone.tdfy_dit.modules.sparse.conv import conv_native
+    from sam3d_objects.model.backbone.tdfy_dit.modules.sparse import SparseTensor
+    with torch.inference_mode(inference), torch.no_grad():
+        x = SparseTensor(torch.randn(3, 2), torch.tensor([[0, 0, 0, 0], [0, 0, 0, 1], [0, 1, 0, 0]]))
+        layers = [conv_native.SparseConv3d(2, 3, 3).eval(), conv_native.SparseConv3d(2, 3, 1).eval()]
+        for layer in layers:
+            layer(x)
+        for coords in [x.coords[[2, 0, 1]], x.coords + torch.tensor([0, 2, 0, 0]), x.coords]:
+            current = x.replace(x.feats * 2, coords=coords)
+            for layer in layers:
+                expected = conv_native._subm_forward(current.feats, current.coords.long(), layer.weight, layer.bias)
+                torch.testing.assert_close(layer(current).feats, expected, rtol=0, atol=0)
+        x.coords[0, 3] = 3
+        for layer in layers:
+            expected = conv_native._subm_forward(x.feats, x.coords.long(), layer.weight, layer.bias)
+            torch.testing.assert_close(layer(x).feats, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('device', ['cpu', 'mps'])
+def test_shared_neighbor_maps_handle_device_and_scale_transitions(device):
+    if device == 'mps' and not torch.backends.mps.is_available():
+        pytest.skip('Requires MPS')
+    from sam3d_objects.model.backbone.tdfy_dit.modules.sparse.conv import conv_native
+    from sam3d_objects.model.backbone.tdfy_dit.modules.sparse import SparseTensor
+    shared = {}
+    coords = torch.tensor([[0, 0, 0, 0], [0, 0, 0, 1], [0, 1, 0, 0]])
+    feats = torch.randn(3, 2)
+    fine = SparseTensor(feats, coords, scale=(1, 1, 1), spatial_cache=shared)
+    coarse = SparseTensor(feats * 2, coords + torch.tensor([0, 0, 2, 0]),
+                          scale=(2, 2, 2), spatial_cache=shared)
+    layer = conv_native.SparseConv3d(2, 3, 3).eval()
+    with torch.no_grad():
+        for target in ['cpu', device, 'cpu']:
+            layer.to(target)
+            for source in [fine, coarse, fine]:
+                x = source.to(target)
+                expected = conv_native._subm_forward(x.feats, x.coords.long(), layer.weight, layer.bias)
+                actual = layer(x)
+                torch.testing.assert_close(actual.feats, expected, rtol=0, atol=0)
+                assert actual.device == x.device
+                assert actual._scale == source._scale
+                assert actual._spatial_cache is shared

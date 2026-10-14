@@ -8,6 +8,11 @@ of repeated general row sorting. Spherical occupancy closing and conservative
 shell bands reduce repair work while retaining the production geometry gates.
 These changes preserve mesh order and strict geometry/fidelity validation.
 
+Native submanifold layers share neighbor maps through the sparse tensor's spatial
+cache. Kernel shape, device, and coordinate values/order are checked before reuse.
+Fresh tensor chains retain the per-module fallback. This avoids duplicate map
+builds across layers; coordinate readback and value validation still run.
+
 Fresh source-only exports may reuse an in-memory geometry certificate after the
 known export axis rotation. Reloaded oriented geometry must match exactly after
 UV seam deduplication and triangle normalization. Reversed winding and duplicate

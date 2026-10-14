@@ -277,6 +277,12 @@ class SparseConv3d(nn.Module):
         indices = x.coords.long()        # [N,4] int64 for indexing
 
         if self._is_subm:
+            cache_key = f"native_subm_neighbors_{self.kernel_size}"
+            shared_cache = x.get_spatial_cache(cache_key)
+            if shared_cache is None:
+                shared_cache = self._subm_neighbor_cache
+                x.register_spatial_cache(cache_key, shared_cache)
+            self._subm_neighbor_cache = shared_cache
             out_feats = _subm_forward(feats, indices, self.weight.float(),
                                        self.bias.float() if self.bias is not None else None,
                                        neighbor_cache=self._subm_neighbor_cache)
