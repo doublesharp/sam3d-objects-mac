@@ -3,7 +3,10 @@
 ## Integrated CPU changes
 
 Native CPU sparse indexing and CPU memory-mapped checkpoint loading avoid GPU
-allocation during load. These changes preserve convolution order and outputs.
+allocation during load. CPU mesh extraction uses exact integer row keys instead
+of repeated general row sorting. Spherical occupancy closing and conservative
+shell bands reduce repair work while retaining the production geometry gates.
+These changes preserve mesh order and strict geometry/fidelity validation.
 
 Fresh source-only exports may reuse an in-memory geometry certificate after the
 known export axis rotation. Reloaded oriented geometry must match exactly after

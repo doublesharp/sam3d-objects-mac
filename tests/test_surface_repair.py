@@ -197,3 +197,20 @@ def test_game_cleanup_repairs_duplicate_surface_and_enforces_budget():
     assert len(result.faces)<=len(source.faces)
     with pytest.raises(RepairRejected,match='budget'):
         repair_game_surface(source.vertices,source.faces,source.vertices,duplicate,max_faces=4)
+
+
+def test_banded_repair_queries_only_conservative_triangle_neighborhood():
+    from sam3d_objects.cpu_repair_utils import sample_shell
+    from sam3d_objects.surface_repair import _scene,_distance
+    vertices=np.array([[0,0,0],[.1,0,0],[0,.1,0]],dtype=np.float32)
+    faces=np.array([[0,1,2]],dtype=np.int64)
+    scene=_scene(vertices,faces)
+    count=[]
+    def measured_distance(scene, points):
+        count.append(len(points))
+        return _distance(scene,points)
+    shape=(41,31,21);origin=np.array([-1.,-.7,-.5],dtype=np.float32)
+    actual=sample_shell(scene,.05,origin,shape,measured_distance,vertices,faces)
+    expected=sample_shell(scene,.05,origin,shape,_distance)
+    assert np.array_equal(actual,expected)
+    assert sum(count)<np.prod(shape)/10

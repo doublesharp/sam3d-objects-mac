@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 import torch
+from sam3d_objects.cpu_mesh_utils import unique_rows
 
 cube_corners = torch.tensor(
     [
@@ -41,7 +42,7 @@ def construct_dense_grid(res, device="cuda"):
 
 def construct_voxel_grid(coords):
     verts = (cube_corners.unsqueeze(0).to(coords) + coords.unsqueeze(1)).reshape(-1, 3)
-    verts_unique, inverse_indices = torch.unique(verts, dim=0, return_inverse=True)
+    verts_unique, inverse_indices = unique_rows(verts, return_inverse=True)
     cubes = inverse_indices.reshape(-1, 8)
     return verts_unique, cubes
 

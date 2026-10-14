@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
+from sam3d_objects.cpu_mesh_utils import unique_rows
 from .tables import *
 from kaolin.utils.testing import check_tensor
 
@@ -193,7 +194,7 @@ class FlexiCubes:
         """
         occ_n = scalar_field < 0
         all_edges = cube_idx[surf_cubes][:, self.cube_edges].reshape(-1, 2)
-        unique_edges, _idx_map, counts = torch.unique(all_edges, dim=0, return_inverse=True, return_counts=True)
+        unique_edges, _idx_map, counts = unique_rows(all_edges, return_inverse=True, return_counts=True)
 
         unique_edges = unique_edges.long()
         mask_edges = occ_n[unique_edges.reshape(-1)].reshape(-1, 2).sum(-1) == 1

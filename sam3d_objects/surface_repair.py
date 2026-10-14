@@ -4,6 +4,7 @@ Healthy meshes bypass remeshing. Defective meshes are rebuilt from a fine
 unsigned-distance shell, with small gaps closed before exterior flood fill.
 Every candidate is checked against the source before it may be exported.
 """
+from .cpu_repair_utils import spherical_closing, sample_shell
 from dataclasses import dataclass
 import time
 import numpy as np
@@ -264,19 +265,12 @@ def repair_surface(vertices, faces, resolution=None, closing_radius=None, force=
     padding = closing_radius+4
     origin = vertices.min(0)-pitch*padding
     shape = np.ceil((vertices.max(0)-origin)/pitch).astype(int)+padding+1
-    axes = [origin[i]+np.arange(shape[i],dtype=np.float32)*pitch for i in range(3)]
     scene = _scene(np.asarray(mesh.vertices,dtype=np.float32),np.asarray(mesh.faces,dtype=np.int64))
-    yz = np.stack(np.meshgrid(axes[1],axes[2],indexing='ij'),axis=-1).reshape(-1,2)
-    shell = np.empty(tuple(shape),dtype=bool)
-    for i,x in enumerate(axes[0]):
-        points = np.empty((len(yz),3),dtype=np.float32);points[:,0]=x;points[:,1:]=yz
-        shell[i] = (_distance(scene,points)<=pitch*.75).reshape(shape[1:])
+    shell = sample_shell(scene,pitch,origin,shape,_distance,mesh.vertices,mesh.faces)
     original_shell = shell.copy()
     sampled_at = time.perf_counter()
     if closing_radius:
-        xyz = np.ogrid[tuple(slice(-closing_radius,closing_radius+1) for _ in range(3))]
-        ball = sum(axis*axis for axis in xyz)<=closing_radius*closing_radius
-        shell = ndimage.binary_closing(shell,structure=ball)
+        shell = spherical_closing(shell,closing_radius)
     solid = ndimage.binary_fill_holes(shell)
     # Closing may seal and fill a narrow interior before flood fill runs.
     # Count added volume from both stages against the original distance shell.

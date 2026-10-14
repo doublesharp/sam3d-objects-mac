@@ -90,3 +90,55 @@ def test_source_visibility_excludes_enclosed_cavity_walls():
     visible=detail_repair._source_visibility(source.vertices,source.faces,source.vertices,.01)
     assert visible[:len(outer.vertices)].all()
     assert not visible[len(outer.vertices):].any()
+
+
+@pytest.mark.parametrize('shape', [(3,4,2),(17,19,15)])
+@pytest.mark.parametrize('radius', [0,1,4,6])
+@pytest.mark.parametrize('kind', ['empty','full','random','boundary'])
+def test_spherical_closing_exact_finite_boundary(shape,radius,kind):
+    from sam3d_objects import cpu_repair_utils
+    assert hasattr(cpu_repair_utils,'spherical_closing')
+    field=np.zeros(shape,dtype=bool)
+    if kind=='full':field[:]=True
+    if kind=='random':field=np.random.default_rng(7).random(shape)>.7
+    if kind=='boundary':field[0]=True;field[-1]=True
+    expected=ndimage.binary_closing(field,structure=detail_repair._ball(radius))
+    assert np.array_equal(cpu_repair_utils.spherical_closing(field,radius),expected)
+
+@pytest.mark.parametrize('kind', ['empty','degenerate','large','small'])
+def test_banded_shell_matches_actual_full_open3d_distances(kind):
+    from sam3d_objects import cpu_repair_utils
+    from sam3d_objects.surface_repair import _scene,_distance
+    assert hasattr(cpu_repair_utils,'sample_shell')
+    vertices=np.array([[0,0,0],[.7,0,0],[0,.3,.2]],dtype=np.float32)
+    faces=np.array([[0,1,2]],dtype=np.int64)
+    if kind=='empty':faces=np.empty((0,3),dtype=np.int64)
+    if kind=='degenerate':vertices[:]=0
+    if kind=='large':vertices*=100
+    scene=_scene(vertices,faces)
+    pitch=.071;origin=np.array([-.213,-.142,-.071],dtype=np.float32);shape=(17,11,7)
+    full=detail_repair._sample_shell(scene,pitch,origin,shape)
+    band=cpu_repair_utils.sample_shell(scene,pitch,origin,shape,_distance,vertices,faces)
+    assert np.array_equal(full,band)
+
+
+@pytest.mark.parametrize('direction', [-1,0,1])
+def test_banded_shell_threshold_ties_and_float32_neighbors(direction):
+    from sam3d_objects import cpu_repair_utils
+    from sam3d_objects.surface_repair import _scene,_distance
+    # Exact binary pitch and translated origin keep the threshold tie representable.
+    pitch=.125
+    origin=np.array([4.,-2.,8.],dtype=np.float32)
+    height=np.float32(origin[2]+pitch*.75)
+    if direction:
+        height=np.nextafter(height,np.float32(-np.inf if direction<0 else np.inf))
+    vertices=np.array([[3.,-3.,height],[6.,-3.,height],[3.,0.,height],[6.,0.,height]],dtype=np.float32)
+    faces=np.array([[0,1,2],[1,3,2]],dtype=np.int64)
+    scene=_scene(vertices,faces)
+    shape=(5,5,4)
+    full=detail_repair._sample_shell(scene,pitch,origin,shape)
+    band=cpu_repair_utils.sample_shell(scene,pitch,origin,shape,_distance,vertices,faces)
+    assert np.array_equal(full,band)
+    assert full.any() and (~full).any()
+    assert full[:,:,0].all() if direction<=0 else not full[:,:,0].any()
+    assert not full[:,:,-1].any()

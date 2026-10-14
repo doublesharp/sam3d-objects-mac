@@ -1,5 +1,6 @@
 """Rebuild a body core while preserving exterior detail on a finer grid."""
 import time
+from .cpu_repair_utils import spherical_closing, sample_shell
 import numpy as np
 import trimesh
 from scipy import ndimage
@@ -27,7 +28,7 @@ def body_core_from_shell(shell, closing_radius=6, opening_radius=3, erosion=1):
     # A one-cell shell can have diagonal leaks at rounded boundary openings.
     # Thicken only the coarse core seed, then undo that offset by erosion.
     seeded=ndimage.binary_dilation(shell,structure=_ball(1))
-    closed=ndimage.binary_closing(seeded,structure=_ball(closing_radius))
+    closed=spherical_closing(seeded,closing_radius)
     filled=ndimage.binary_fill_holes(closed)
     opened=ndimage.binary_opening(filled,structure=_ball(opening_radius))
     opened=ndimage.binary_erosion(opened,iterations=int(erosion)+1)
@@ -50,15 +51,8 @@ def _grid(vertices,resolution,padding=10):
     return pitch,origin,shape
 
 
-def _sample_shell(scene,pitch,origin,shape,progress=None):
-    axes=[origin[i]+np.arange(shape[i],dtype=np.float32)*pitch for i in range(3)]
-    yz=np.stack(np.meshgrid(axes[1],axes[2],indexing='ij'),axis=-1).reshape(-1,2)
-    shell=np.empty(tuple(shape),dtype=bool)
-    for i,x in enumerate(axes[0]):
-        points=np.empty((len(yz),3),dtype=np.float32);points[:,0]=x;points[:,1:]=yz
-        shell[i]=(_distance(scene,points)<=pitch*.75).reshape(shape[1:])
-        if progress and (i%24==0 or i+1==len(axes[0])):progress(f'Detail field {i+1}/{len(axes[0])}')
-    return shell
+def _sample_shell(scene,pitch,origin,shape,progress=None,vertices=None,faces=None):
+    return sample_shell(scene,pitch,origin,shape,_distance,vertices,faces,progress)
 
 
 def _sample_grid(field,points,pitch,origin,order=0):
@@ -201,11 +195,11 @@ def repair_with_protected_detail(vertices,faces,resolution=256,core_resolution=9
         raise ValueError('Repair input has no spatial extent')
     before=topology(vertices,faces);scene=_scene(vertices,faces)
     coarse_pitch,coarse_origin,coarse_shape=_grid(vertices,core_resolution,closing_radius+5)
-    shell=_sample_shell(scene,coarse_pitch,coarse_origin,coarse_shape)
+    shell=_sample_shell(scene,coarse_pitch,coarse_origin,coarse_shape,vertices=vertices,faces=faces)
     core=body_core_from_shell(shell,closing_radius,opening_radius,erosion)
     core_seconds=time.perf_counter()-started
     pitch,origin,shape=_grid(vertices,resolution)
-    fine_shell=_sample_shell(scene,pitch,origin,shape,progress)
+    fine_shell=_sample_shell(scene,pitch,origin,shape,progress,vertices,faces)
     upsampled=_upsample_core(core,coarse_pitch,coarse_origin,pitch,origin,shape)
     solid=_largest_volume(compose_body_and_detail(fine_shell,upsampled))
     if cache_path:
