@@ -5,8 +5,8 @@
 # Weight layout mirrors spconv: [K, K, K, in_channels, out_channels]
 # Coordinate layout: [N, 4] — (batch, z, y, x)
 #
-# Performance note: these are correct reference implementations. They are not
-# optimised for speed; correctness comes first.
+# Coordinate indexing uses sparse NumPy keys and keeps kernel accumulation
+# order identical to the native reference implementation.
 
 from __future__ import annotations
 import torch
@@ -32,10 +32,113 @@ __all__ = ["SparseConv3d", "SparseInverseConv3d"]
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_coord_map(indices: torch.Tensor) -> dict:
-    """Build a dict (b, z, y, x) -> row_index (on CPU as plain Python ints)."""
-    cpu = indices.cpu().numpy()
-    return {(int(r[0]), int(r[1]), int(r[2]), int(r[3])): i for i, r in enumerate(cpu)}
+_COORD_DTYPE = np.dtype([(name, np.int64) for name in ("b", "z", "y", "x")])
+
+
+def _coordinate_keys(coords: np.ndarray) -> np.ndarray:
+    """Lexicographic keys without packed-key overflow or a dense spatial grid."""
+    return np.ascontiguousarray(coords, dtype=np.int64).view(_COORD_DTYPE).reshape(-1)
+
+
+class _CoordinateLookup:
+    """Sparse sorted lookup retaining the original dict's last-duplicate rule."""
+    def __init__(self, coords: np.ndarray):
+        coords = np.asarray(coords, dtype=np.int64)
+        self.bounds = None
+        if len(coords):
+            lower = coords.min(axis=0)
+            upper = coords.max(axis=0)
+            extents = [int(high) - int(low) + 1 for low, high in zip(lower, upper)]
+            volume = 1
+            for extent in extents:
+                volume *= extent
+            if volume <= np.iinfo(np.int64).max:
+                self.bounds = (lower, upper, extents)
+        keys = self._encode(coords)
+        self.order = np.argsort(keys, kind="stable")
+        self.keys = keys[self.order]
+
+    def _encode(self, coords: np.ndarray) -> np.ndarray:
+        if self.bounds is None:
+            return _coordinate_keys(coords)
+        lower, _, extents = self.bounds
+        shifted = coords - lower
+        keys = shifted[:, 0].copy()
+        for axis in range(1, 4):
+            keys *= extents[axis]
+            keys += shifted[:, axis]
+        return keys
+
+    def lookup(self, coords: np.ndarray) -> np.ndarray:
+        coords = np.asarray(coords, dtype=np.int64)
+        result = np.full(len(coords), -1, dtype=np.int64)
+        if len(self.keys):
+            if self.bounds is None:
+                rows = np.arange(len(coords))
+            else:
+                lower, upper, _ = self.bounds
+                # Reject out-of-bounds queries before encoding to prevent aliasing.
+                rows = np.flatnonzero(np.all((coords >= lower) & (coords <= upper), axis=1))
+            queries = self._encode(coords[rows])
+            positions = np.searchsorted(self.keys, queries, side="right") - 1
+            valid = positions >= 0
+            valid[valid] &= self.keys[positions[valid]] == queries[valid]
+            result[rows[valid]] = self.order[positions[valid]]
+        return result
+
+
+def _expanded_coordinate_pairs(
+    coords: np.ndarray,
+    kernel_shape: Tuple[int, int, int],
+    stride: Tuple[int, int, int],
+    spatial_bounds=None,
+    *,
+    inverse=False,
+):
+    """Sorted sparse output union and per-kernel source/destination row pairs.
+
+    Temporary storage scales with input voxels times kernel volume, never with
+    spatial volume. Strided pairs retain input order and duplicate contributions;
+    inverse pairs retain sorted output order with one contribution per output.
+    """
+    coords = np.asarray(coords, dtype=np.int64)
+    base = coords.copy()
+    if inverse:
+        base[:, 1:] *= np.asarray(stride)
+    else:
+        base[:, 1:] //= np.asarray(stride)
+    sources = _CoordinateLookup(coords).lookup(coords)
+    chunks, source_chunks = [], []
+    Kz, Ky, Kx = kernel_shape
+    for kz in range(Kz):
+        for ky in range(Ky):
+            for kx in range(Kx):
+                shifted = base.copy()
+                shifted[:, 1:] += (kz - Kz // 2, ky - Ky // 2, kx - Kx // 2)
+                valid = np.ones(len(coords), dtype=bool)
+                if inverse or spatial_bounds is not None:
+                    valid &= np.all(shifted[:, 1:] >= 0, axis=1)
+                if spatial_bounds is not None:
+                    valid &= np.all(shifted[:, 1:] < np.asarray(spatial_bounds), axis=1)
+                chunks.append(shifted[valid])
+                source_chunks.append(sources[valid])
+    all_coords = np.concatenate(chunks)
+    union = _CoordinateLookup(all_coords)
+    first = np.ones(len(union.keys), dtype=bool)
+    first[1:] = union.keys[1:] != union.keys[:-1]
+    output_coords = all_coords[union.order[first]]
+    destinations = np.empty(len(all_coords), dtype=np.int64)
+    destinations[union.order] = np.cumsum(first) - 1
+    pairs, offset = [], 0
+    for chunk, src in zip(chunks, source_chunks):
+        dst = destinations[offset:offset + len(chunk)]
+        offset += len(chunk)
+        if inverse:
+            # np.unique sorts destinations just like the old fine-coordinate loop.
+            dst, first = np.unique(dst, return_index=True)
+            src = src[first]
+        pairs.append((src, dst))
+    return output_coords, pairs
 
 
 def _subm_forward(
@@ -56,24 +159,18 @@ def _subm_forward(
             and np.array_equal(entry[2], cpu_idx)):
         pairs = entry[3]
     else:
-        coord_map = {
-            tuple(int(value) for value in row): i for i, row in enumerate(cpu_idx)
-        }
+        lookup = _CoordinateLookup(cpu_idx)
         pairs = []
         for kz in range(Kz):
             for ky in range(Ky):
                 for kx in range(Kx):
-                    dz, dy, dx = kz - Kz // 2, ky - Ky // 2, kx - Kx // 2
-                    src_idx, nb_idx = [], []
-                    for i, row in enumerate(cpu_idx):
-                        b, z, y, x = (int(value) for value in row)
-                        j = coord_map.get((b, z + dz, y + dy, x + dx))
-                        if j is not None:
-                            src_idx.append(i)
-                            nb_idx.append(j)
+                    shifted = cpu_idx.copy()
+                    shifted[:, 1:] += (kz - Kz // 2, ky - Ky // 2, kx - Kx // 2)
+                    neighbors = lookup.lookup(shifted)
+                    src_idx = np.flatnonzero(neighbors >= 0)
                     pairs.append((
                         torch.tensor(src_idx, dtype=torch.long, device=feats.device),
-                        torch.tensor(nb_idx, dtype=torch.long, device=feats.device),
+                        torch.tensor(neighbors[src_idx], dtype=torch.long, device=feats.device),
                     ))
         if neighbor_cache is not None:
             # One atomic replacement; concurrent callers retain their local entry.
@@ -109,85 +206,33 @@ def _sparse_forward(
     out_indices are int64 sorted by batch.
     """
     Kz, Ky, Kx, Cin, Cout = weight.shape
-    sz, sy, sx = stride
-
-    # Compute output coords: floor(in_coord / stride), for each voxel × kernel offset
-    out_coord_set: set = set()
     cpu_idx = indices.cpu().numpy()
-
-    for i in range(len(cpu_idx)):
-        b = int(cpu_idx[i, 0])
-        z = int(cpu_idx[i, 1])
-        y = int(cpu_idx[i, 2])
-        x = int(cpu_idx[i, 3])
-        for kz in range(Kz):
-            dz = kz - Kz // 2
-            for ky in range(Ky):
-                dy = ky - Ky // 2
-                for kx in range(Kx):
-                    dx = kx - Kx // 2
-                    oz = (z + dz * sz) // sz  # simplified: stride conv output coord
-                    oy = (y + dy * sy) // sy
-                    ox = (x + dx * sx) // sx
-                    Dout = (spatial_shape[0] + padding * 2 - Kz) // sz + 1 if spatial_shape else None
-                    Hout = (spatial_shape[1] + padding * 2 - Ky) // sy + 1 if spatial_shape else None
-                    Wout = (spatial_shape[2] + padding * 2 - Kx) // sx + 1 if spatial_shape else None
-                    if Dout is not None and (oz < 0 or oz >= Dout): continue
-                    if Hout is not None and (oy < 0 or oy >= Hout): continue
-                    if Wout is not None and (ox < 0 or ox >= Wout): continue
-                    out_coord_set.add((b, oz, oy, ox))
-
-    # Sort output coords by (batch, z, y, x) for downstream layout invariant
-    out_coords_list = sorted(out_coord_set)
-    if not out_coords_list:
+    bounds = [(size + padding * 2 - kernel) // step + 1
+              for size, kernel, step in zip(spatial_shape, (Kz, Ky, Kx), stride)] if spatial_shape else None
+    out_coords, pairs = _expanded_coordinate_pairs(cpu_idx, (Kz, Ky, Kx), stride, bounds)
+    if not len(out_coords):
         empty_idx = torch.zeros((0, 4), dtype=torch.int64, device=feats.device)
         empty_f = torch.zeros((0, Cout), dtype=feats.dtype, device=feats.device)
         return empty_f, empty_idx, [0, 0, 0]
 
-    out_idx_t = torch.tensor(out_coords_list, dtype=torch.int64, device=feats.device)
-    Nout = out_idx_t.shape[0]
-    out_feats = torch.zeros(Nout, Cout, dtype=feats.dtype, device=feats.device)
-
-    out_map = {c: i for i, c in enumerate(out_coords_list)}
-    coord_map = _build_coord_map(indices)
-
+    out_idx_t = torch.tensor(out_coords, dtype=torch.int64, device=feats.device)
+    out_feats = torch.zeros(len(out_coords), Cout, dtype=feats.dtype, device=feats.device)
+    pair_index = 0
     for kz in range(Kz):
-        dz = kz - Kz // 2
         for ky in range(Ky):
-            dy = ky - Ky // 2
             for kx in range(Kx):
-                dx = kx - Kx // 2
-                W = weight[kz, ky, kx]  # [Cin, Cout]
-
-                src_idx_list = []
-                dst_idx_list = []
-
-                for i in range(len(cpu_idx)):
-                    b  = int(cpu_idx[i, 0])
-                    iz = int(cpu_idx[i, 1])
-                    iy = int(cpu_idx[i, 2])
-                    ix_ = int(cpu_idx[i, 3])
-                    oz = (iz + dz * sz) // sz
-                    oy = (iy + dy * sy) // sy
-                    ox = (ix_ + dx * sx) // sx
-                    dst_key = (b, oz, oy, ox)
-                    di = out_map.get(dst_key)
-                    si = coord_map.get((b, iz, iy, ix_))
-                    if di is not None and si is not None:
-                        src_idx_list.append(si)
-                        dst_idx_list.append(di)
-
-                if src_idx_list:
-                    src_t = torch.tensor(src_idx_list, device=feats.device)
-                    dst_t = torch.tensor(dst_idx_list, device=feats.device)
-                    contrib = (feats[src_t] @ W).to(out_feats.dtype)   # [M, Cout]
+                src_idx, dst_idx = pairs[pair_index]
+                pair_index += 1
+                if len(src_idx):
+                    src_t = torch.tensor(src_idx, dtype=torch.long, device=feats.device)
+                    dst_t = torch.tensor(dst_idx, dtype=torch.long, device=feats.device)
+                    contrib = (feats[src_t] @ weight[kz, ky, kx]).to(out_feats.dtype)
                     out_feats.index_add_(0, dst_t, contrib)
 
     if bias is not None:
         out_feats = out_feats + bias
 
-    bs, zs, ys, xs = zip(*out_coords_list)
-    out_spatial = [max(zs) + 1, max(ys) + 1, max(xs) + 1]
+    out_spatial = (out_coords[:, 1:].max(axis=0) + 1).tolist()
 
     return out_feats, out_idx_t, out_spatial
 
@@ -334,30 +379,10 @@ class SparseInverseConv3d(nn.Module):
         coarse_idx = data.indices.long()   # [N, 4]
         feats = data.features.float()      # [N, Cin]
         Kz, Ky, Kx, Cout, Cin = self.weight.shape
-        sz, sy, sx = self.stride
-
-        # Collect fine output coords (all possible fine voxels)
-        fine_coord_set: set = set()
         cpu_coarse = coarse_idx.cpu().numpy()
-        for i in range(len(cpu_coarse)):
-            b = int(cpu_coarse[i, 0])
-            z = int(cpu_coarse[i, 1])
-            y = int(cpu_coarse[i, 2])
-            xc = int(cpu_coarse[i, 3])
-            for kz in range(Kz):
-                dz = kz - Kz // 2
-                for ky in range(Ky):
-                    dy = ky - Ky // 2
-                    for kx in range(Kx):
-                        dx = kx - Kx // 2
-                        fz = z * sz + dz
-                        fy = y * sy + dy
-                        fx = xc * sx + dx
-                        if fz >= 0 and fy >= 0 and fx >= 0:
-                            fine_coord_set.add((b, fz, fy, fx))
-
-        fine_coords_list = sorted(fine_coord_set)
-        if not fine_coords_list:
+        fine_coords, pairs = _expanded_coordinate_pairs(
+            cpu_coarse, (Kz, Ky, Kx), self.stride, inverse=True)
+        if not len(fine_coords):
             empty_idx = torch.zeros((0, 4), dtype=torch.int32, device=x.feats.device)
             empty_f = torch.zeros((0, self.out_channels), dtype=x.feats.dtype, device=x.feats.device)
             new_data = NativeSparseData(empty_f, empty_idx, [0, 0, 0], x.data.batch_size)
@@ -367,42 +392,18 @@ class SparseInverseConv3d(nn.Module):
                                 scale=tuple(s // stride for s, stride in zip(x._scale, self.stride)),
                                 spatial_cache=x._spatial_cache)
 
-        fine_map = {c: i for i, c in enumerate(fine_coords_list)}
-        fine_idx_t = torch.tensor(fine_coords_list, dtype=torch.int64, device=x.feats.device)
-        Nfine = fine_idx_t.shape[0]
-        out_feats = torch.zeros(Nfine, self.out_channels, dtype=feats.dtype, device=feats.device)
-
-        coarse_map = _build_coord_map(coarse_idx)
-
+        fine_idx_t = torch.tensor(fine_coords, dtype=torch.int64, device=x.feats.device)
+        out_feats = torch.zeros(len(fine_coords), self.out_channels, dtype=feats.dtype, device=feats.device)
+        pair_index = 0
         for kz in range(Kz):
-            dz = kz - Kz // 2
             for ky in range(Ky):
-                dy = ky - Ky // 2
                 for kx in range(Kx):
-                    dx = kx - Kx // 2
-                    # weight[kz,ky,kx]: [Cout, Cin] — transpose of forward weight
-                    W = self.weight[kz, ky, kx]  # [Cout, Cin]
-
-                    src_list = []
-                    dst_list = []
-                    for fi, fc in enumerate(fine_coords_list):
-                        b, fz, fy, fx = fc
-                        cz = (fz - dz) // sz
-                        cy = (fy - dy) // sy
-                        cx_ = (fx - dx) // sx
-                        if (fz - dz) % sz != 0: continue
-                        if (fy - dy) % sy != 0: continue
-                        if (fx - dx) % sx != 0: continue
-                        si = coarse_map.get((b, cz, cy, cx_))
-                        if si is not None:
-                            src_list.append(si)
-                            dst_list.append(fi)
-
-                    if src_list:
-                        src_t = torch.tensor(src_list, device=feats.device)
-                        dst_t = torch.tensor(dst_list, device=feats.device)
-                        # feats[src] @ W.T  => [M, Cout]
-                        contrib = (feats[src_t] @ W.T).to(out_feats.dtype)
+                    src_idx, dst_idx = pairs[pair_index]
+                    pair_index += 1
+                    if len(src_idx):
+                        src_t = torch.tensor(src_idx, dtype=torch.long, device=feats.device)
+                        dst_t = torch.tensor(dst_idx, dtype=torch.long, device=feats.device)
+                        contrib = (feats[src_t] @ self.weight[kz, ky, kx].T).to(out_feats.dtype)
                         out_feats.index_add_(0, dst_t, contrib)
 
         if self.bias is not None:
@@ -411,8 +412,7 @@ class SparseInverseConv3d(nn.Module):
         out_feats = out_feats.to(x.feats.dtype)
         fine_idx_i32 = fine_idx_t.to(torch.int32)
 
-        bs_, zs, ys, xs = zip(*fine_coords_list)
-        fine_spatial = [max(zs) + 1, max(ys) + 1, max(xs) + 1]
+        fine_spatial = (fine_coords[:, 1:].max(axis=0) + 1).tolist()
 
         new_data = NativeSparseData(out_feats, fine_idx_i32, fine_spatial, x.data.batch_size)
         out = _get_SparseTensor()(
