@@ -13,6 +13,9 @@ repair safeguards, and M2 Max timings,
 [PORT_LOG.md](PORT_LOG.md) for the port changes, and
 [README.upstream.md](README.upstream.md) for Meta's original README.
 
+New finished exports use 4K textures; previews can use 2K. See
+[texture rebaking](docs/texture-rebake.md) for saved models.
+
 `feature/mps-performance` holds generic SAM generation, repair, export, and
 performance improvements. Custom viewers, rigging workflows, third-party model
 adapters, and project-specific experiments belong on
