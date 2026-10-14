@@ -1,0 +1,325 @@
+diff --git a/src/model/michelangelo/models/tsal/sal_perceiver.py b/src/model/michelangelo/models/tsal/sal_perceiver.py
+index 3300fd0..6d697ad 100644
+--- a/src/model/michelangelo/models/tsal/sal_perceiver.py
++++ b/src/model/michelangelo/models/tsal/sal_perceiver.py
+@@ -25,7 +25,7 @@ import torch.nn as nn
+ from typing import Optional, Union
+ from einops import repeat
+ import math
+-from torch_cluster import fps
++from ....portable_fps import fps
+ import random
+ import time
+ import numpy as np
+diff --git a/src/model/parse.py b/src/model/parse.py
+index be065d3..1310b6e 100644
+--- a/src/model/parse.py
++++ b/src/model/parse.py
+@@ -1,14 +1,11 @@
+-from .unirig_ar import UniRigAR
+-from .unirig_skin import UniRigSkin
+-
+ from .spec import ModelSpec
+ 
+ def get_model(**kwargs) -> ModelSpec:
+-    MAP = {
+-        'unirig_ar': UniRigAR,
+-        'unirig_skin': UniRigSkin,
+-    }
+-    __target__ = kwargs['__target__']
+-    del kwargs['__target__']
+-    assert __target__ in MAP, f"expect: [{','.join(MAP.keys())}], found: {__target__}"
+-    return MAP[__target__](**kwargs)
+\ No newline at end of file
++    target = kwargs.pop('__target__')
++    if target == 'unirig_ar':
++        from .unirig_ar import UniRigAR
++        return UniRigAR(**kwargs)
++    if target == 'unirig_skin':
++        from .unirig_skin import UniRigSkin
++        return UniRigSkin(**kwargs)
++    raise ValueError(f'unknown model target: {target}')
+diff --git a/src/model/parse_encoder.py b/src/model/parse_encoder.py
+index 8d51f0f..2da53f7 100644
+--- a/src/model/parse_encoder.py
++++ b/src/model/parse_encoder.py
+@@ -1,15 +1,14 @@
+-from dataclasses import dataclass
+ 
+ from .michelangelo.get_model import get_encoder as get_encoder_michelangelo
+ from .michelangelo.get_model import AlignedShapeLatentPerceiver
+ from .michelangelo.get_model import get_encoder_simplified as get_encoder_michelangelo_encoder
+ from .michelangelo.get_model import ShapeAsLatentPerceiverEncoder
+-from .pointcept.models.PTv3Object import get_encoder as get_encoder_ptv3obj
+-from .pointcept.models.PTv3Object import PointTransformerV3Object
+ 
+-@dataclass(frozen=True)
+ class _MAP_MESH_ENCODER:
+-    ptv3obj = PointTransformerV3Object
++    @property
++    def ptv3obj(self):
++        from .pointcept.models.PTv3Object import PointTransformerV3Object
++        return PointTransformerV3Object
+     michelangelo = AlignedShapeLatentPerceiver
+     michelangelo_encoder = ShapeAsLatentPerceiverEncoder
+ 
+@@ -17,8 +16,11 @@ MAP_MESH_ENCODER = _MAP_MESH_ENCODER()
+ 
+ 
+ def get_mesh_encoder(**kwargs):
++    if kwargs['__target__'] == 'ptv3obj':
++        from .pointcept.models.PTv3Object import get_encoder
++        kwargs = kwargs.copy();kwargs.pop('__target__')
++        return get_encoder(**kwargs)
+     MAP = {
+-        'ptv3obj': get_encoder_ptv3obj,
+         'michelangelo': get_encoder_michelangelo,
+         'michelangelo_encoder': get_encoder_michelangelo_encoder,
+     }
+diff --git a/src/model/unirig_ar.py b/src/model/unirig_ar.py
+index 14a90d8..d0bbb27 100644
+--- a/src/model/unirig_ar.py
++++ b/src/model/unirig_ar.py
+@@ -10,6 +10,8 @@ from .parse_encoder import MAP_MESH_ENCODER, get_mesh_encoder
+ 
+ from ..tokenizer.spec import TokenizerSpec, DetokenizeOutput
+ from copy import deepcopy
++from pathlib import Path
++from .portable_generation import install_empty_history_repetition_guard
+ 
+ class VocabSwitchingLogitsProcessor(LogitsProcessor):
+     def __init__(self, tokenizer: TokenizerSpec, start_tokens: LongTensor):
+@@ -48,12 +50,17 @@ class UniRigAR(ModelSpec):
+         
+         _d = llm.copy()
+         _d['vocab_size'] = self.tokenizer.vocab_size
++        local_opt = Path('models/opt-350m')
++        if local_opt.exists():
++            _d['pretrained_model_name_or_path'] = str(local_opt)
++        _d['_attn_implementation'] = 'sdpa'
+         llm_config = AutoConfig.from_pretrained(**_d)
+         # Force float32 precision for the model
+         llm_config.torch_dtype = torch.float32
+         # Force enable pre_norm
+         llm_config.pre_norm = True
+-        self.transformer = AutoModelForCausalLM.from_config(config=llm_config)
++        self.transformer = AutoModelForCausalLM.from_config(config=llm_config, attn_implementation="sdpa")
++        install_empty_history_repetition_guard(self.transformer)
+         
+         self.hidden_size = llm.hidden_size
+         
+diff --git a/src/model/portable_fps.py b/src/model/portable_fps.py
+new file mode 100644
+index 0000000..82f1fd3
+--- /dev/null
++++ b/src/model/portable_fps.py
+@@ -0,0 +1,22 @@
++"""Deterministic CPU FPS for the external skeleton research runtime.
++
++Matches the eval-mode algorithm/count/tie rules in pytorch_cluster's CPU FPS:
++https://github.com/rusty1s/pytorch_cluster/blob/master/csrc/cpu/fps_cpu.cpp
++No compiled extension or GPU kernel is used for point selection.
++"""
++import numpy as np
++import torch
++
++def fps(x,batch,ratio,random_start=False):
++ if random_start:raise ValueError('research FPS supports deterministic inference only')
++ if x.ndim!=2 or batch.ndim!=1 or len(x)!=len(batch) or not 0<ratio<=1:raise ValueError('invalid FPS points, batch or ratio')
++ points=x.detach().cpu().numpy();labels=batch.detach().cpu().numpy()
++ if not np.isfinite(points).all() or np.any(labels<0) or np.any(labels[1:]<labels[:-1]):raise ValueError('FPS requires finite points and sorted nonnegative batch labels')
++ result=[]
++ for label in np.unique(labels):
++  indices=np.flatnonzero(labels==label);p=points[indices];count=int(np.ceil(np.float32(len(p))*np.float32(ratio)))
++  start=0;distance=np.sum((p-p[start])**2,axis=1);selected=[indices[start]]
++  for _ in range(1,count):
++   start=int(np.argmax(distance));selected.append(indices[start]);distance=np.minimum(distance,np.sum((p-p[start])**2,axis=1))
++  result.extend(selected)
++ return torch.tensor(result,dtype=torch.long,device=x.device)
+diff --git a/src/model/portable_generation.py b/src/model/portable_generation.py
+new file mode 100644
+index 0000000..94eb8d0
+--- /dev/null
++++ b/src/model/portable_generation.py
+@@ -0,0 +1,19 @@
++"""Model-local empty-history repetition guard, no installed-library patch."""
++from types import MethodType
++from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
++
++class EmptyHistorySafeRepetitionPenalty(RepetitionPenaltyLogitsProcessor):
++ def __call__(self,input_ids,scores):
++  history=input_ids[:,self.prompt_ignore_length:] if self.prompt_ignore_length else input_ids
++  return scores if history.numel()==0 else super().__call__(input_ids,scores)
++
++def install_empty_history_repetition_guard(transformer):
++ if getattr(transformer,'_unirig_generation_guard_installed',False):return
++ original=transformer._get_logits_processor.__func__
++ def guarded(self,*args,**kwargs):
++  processors=original(self,*args,**kwargs)
++  for index,processor in enumerate(processors):
++   if type(processor) is RepetitionPenaltyLogitsProcessor:
++    replacement=EmptyHistorySafeRepetitionPenalty(processor.penalty);replacement.__dict__.update(processor.__dict__);processors[index]=replacement
++  return processors
++ transformer._get_logits_processor=MethodType(guarded,transformer);transformer._unirig_generation_guard_installed=True
+diff --git a/ar_runtime.py b/ar_runtime.py
+new file mode 100644
+index 0000000..b59ab50
+--- /dev/null
++++ b/ar_runtime.py
+@@ -0,0 +1,21 @@
++"""Direct external AR model loading; no Lightning CUDA trainer or skin model."""
++import time
++from pathlib import Path
++import torch,yaml
++from box import Box
++from src.tokenizer.spec import TokenizerConfig
++from src.tokenizer.parse import get_tokenizer
++from src.model.parse import get_model
++
++def load_ar_model():
++ start=time.perf_counter()
++ tokenizer_cfg=Box(yaml.safe_load(Path('configs/tokenizer/tokenizer_parts_articulationxl_256.yaml').read_text()))
++ tokenizer=get_tokenizer(TokenizerConfig.parse(tokenizer_cfg))
++ model_cfg=Box(yaml.safe_load(Path('configs/model/unirig_ar_350m_1024_81920_float32.yaml').read_text()))
++ model=get_model(**model_cfg,tokenizer=tokenizer)
++ checkpoint=torch.load('experiments/skeleton/articulation-xl_quantization_256/model.ckpt',map_location='cpu',weights_only=True,mmap=True)
++ state=checkpoint['state_dict'];assert all(k.startswith('model.') for k in state)
++ result=model.load_state_dict({k.removeprefix('model.'):v for k,v in state.items()},strict=True)
++ model.eval().to('cpu',torch.float32)
++ info=dict(strict=True,missing_keys=result.missing_keys,unexpected_keys=result.unexpected_keys,parameters=sum(p.numel() for p in model.parameters()),load_seconds=time.perf_counter()-start,transformer_attention=model.transformer.config._attn_implementation,mesh_encoder_type=type(model.mesh_encoder).__name__)
++ return model,info
+diff --git a/run_ar_local.py b/run_ar_local.py
+new file mode 100644
+index 0000000..88295f8
+--- /dev/null
++++ b/run_ar_local.py
+@@ -0,0 +1,52 @@
++"""External skeleton-only research candidate. No skin model, templates or export."""
++import argparse,json,resource,threading,time,traceback
++from pathlib import Path
++from types import SimpleNamespace
++import numpy as np,torch,trimesh,yaml
++from box import Box
++from ar_runtime import load_ar_model
++from src.data.sampler import SamplerMix,SamplerConfig
++
++p=argparse.ArgumentParser();p.add_argument('--input',required=True);p.add_argument('--output',required=True);p.add_argument('--device',choices=['cpu','mps'],default='cpu');p.add_argument('--beams',type=int,default=1);p.add_argument('--seed',type=int,default=1234);p.add_argument('--max-time',type=float,default=120);p.add_argument('--max-new-tokens',type=int,default=2048);p.add_argument('--threads',type=int,default=2);a=p.parse_args()
++out=Path(a.output);out.mkdir(parents=True,exist_ok=True);start=time.perf_counter();r=dict(input=a.input,device=a.device,dtype='float32',beams=a.beams,seed=a.seed,max_time=a.max_time,max_new_tokens=a.max_new_tokens,status='running',automatic=True,skeleton_only=True,anatomy_approved=False);done=threading.Event()
++def memory():
++ return dict(max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,mps_allocated_bytes=torch.mps.current_allocated_memory() if a.device=='mps' else None,mps_driver_bytes=torch.mps.driver_allocated_memory() if a.device=='mps' else None)
++def save():r.update(elapsed_seconds=time.perf_counter()-start,**memory());(out/'result.json').write_text(json.dumps(r,indent=2))
++def sync():
++ if a.device=='mps':torch.mps.synchronize()
++def timed(name,fn):
++ sync();t=time.perf_counter();res=fn();sync();r[name+'_seconds']=time.perf_counter()-t;print(name,r[name+'_seconds'],flush=True);save();return res
++def monitor():
++ while not done.is_set():
++  if a.device=='mps':
++   r['mps_allocated_peak_sampled_bytes']=max(r.get('mps_allocated_peak_sampled_bytes',0),torch.mps.current_allocated_memory());r['mps_driver_peak_sampled_bytes']=max(r.get('mps_driver_peak_sampled_bytes',0),torch.mps.driver_allocated_memory())
++  done.wait(.1)
++try:
++ torch.set_num_threads(a.threads);torch.manual_seed(a.seed);np.random.seed(a.seed)
++ if a.device=='mps':torch.mps.set_per_process_memory_fraction(.45)
++ threading.Thread(target=monitor,daemon=True).start();r['memory_before']=memory()
++ mesh=trimesh.load(a.input,force='scene',process=False).to_geometry();center=mesh.bounds.mean(0);scale=np.ptp(mesh.bounds,axis=0).max()/2;basis=np.array([[1,0,0],[0,0,-1],[0,1,0]])
++ transform=Box(yaml.safe_load(Path('configs/transform/inference_ar_transform.yaml').read_text()));cfg=SamplerConfig.parse(transform['predict_transform_config']['sampler_config']);sampler=SamplerMix(cfg)
++ asset=SimpleNamespace(vertices=((mesh.vertices-center)/scale)@basis.T,vertex_normals=mesh.vertex_normals@basis.T,faces=mesh.faces,face_normals=mesh.face_normals@basis.T,vertex_groups={})
++ sampled=timed('sampling',lambda:sampler.sample(asset));r.update(input_vertices=len(mesh.vertices),input_faces=len(mesh.faces),actual_points=len(sampled.vertices),surface_points=cfg.num_samples-min(cfg.vertex_samples,len(mesh.vertices)),vertex_points=min(cfg.vertex_samples,len(mesh.vertices)),normalization_center=center.tolist(),normalization_scale=float(scale),coordinate_basis=basis.tolist())
++ model,load_info=load_ar_model();r['strict_load']=load_info;model=timed('device_transfer',lambda:model.to(a.device,torch.float32));save()
++ x=torch.tensor(sampled.vertices,device=a.device,dtype=torch.float32);n=torch.tensor(sampled.normals,device=a.device,dtype=torch.float32)
++ original=model.transformer.generate
++ def capture(*args,**kwargs):
++  result=original(*args,**kwargs);raw=result[0].detach().cpu().numpy();np.save(out/'generated_tokens.npy',raw);r.update(tokens=len(raw),final_token=int(raw[-1]),eos=int(model.tokenizer.eos),eos_present=bool(np.any(raw==model.tokenizer.eos)));save();return result
++ model.transformer.generate=capture
++ with torch.inference_mode():
++  skeleton=timed('generation',lambda:model.generate(vertices=x,normals=n,cls='articulationxl',max_new_tokens=a.max_new_tokens,max_time=a.max_time,num_beams=a.beams,num_return_sequences=1,do_sample=True,top_k=5,top_p=.95,repetition_penalty=3.,temperature=1.5))
++ if r['final_token']!=model.tokenizer.eos:raise ValueError('generation did not complete with skeleton EOS')
++ joints=(skeleton.joints@basis)*scale+center;parents=np.array([-1 if p is None else p for p in skeleton.parents],dtype=int)
++ if len(joints)==0 or not np.isfinite(joints).all() or np.count_nonzero(parents==-1)!=1 or np.any((parents < -1)|(parents>=len(joints))):raise ValueError('invalid decoded skeleton coordinates or parent indices')
++ for i in range(len(parents)):
++  seen=set();current=i
++  while current!=-1:
++   if current in seen:raise ValueError('decoded skeleton contains a parent cycle')
++   seen.add(current);current=int(parents[current])
++ np.savez_compressed(out/'skeleton.npz',joints=joints,parents=parents,vertices=mesh.vertices,faces=mesh.faces,tokens=skeleton.tokens)
++ (out/'skeleton.json').write_text(json.dumps(dict(joints=joints.tolist(),parents=parents.tolist(),joint_names=skeleton.names),indent=2))
++ r.update(status='skeleton_math_passed_anatomy_pending',joints=len(joints),joints_finite=True,valid_hierarchy=True,skin_weights_generated=False);done.set();save()
++except Exception as error:
++ done.set();r.update(status='failed',error=repr(error),traceback=traceback.format_exc());save();raise
+diff --git a/test_ar_portability.py b/test_ar_portability.py
+new file mode 100644
+index 0000000..3b6ff6f
+--- /dev/null
++++ b/test_ar_portability.py
+@@ -0,0 +1,8 @@
++"""Skeleton imports must not require the optional PTv3 skinning stack."""
++import sys
++from src.model.unirig_ar import UniRigAR
++from src.model.parse import get_model
++from src.model.portable_fps import fps
++for name in ['spconv','torch_scatter','flash_attn','torch_cluster']:
++ assert not any(x==name or x.startswith(name+'.') for x in sys.modules),name
++print('PASS skeleton imports avoid optional sparse/skinning/compiled FPS dependencies')
+diff --git a/test_fps_cpu.py b/test_fps_cpu.py
+new file mode 100644
+index 0000000..a16e3f7
+--- /dev/null
++++ b/test_fps_cpu.py
+@@ -0,0 +1,25 @@
++"""Compare deterministic FPS against the upstream CPU algorithm in PyTorch.
++
++The native torch_cluster binary is not installed; this is algorithm/index
++parity with its published implementation, not execution of that binary.
++"""
++import json,time
++from pathlib import Path
++import numpy as np,torch
++from src.model.portable_fps import fps
++
++torch.set_num_threads(2)
++def reference(x,batch,ratio):
++ result=[]
++ for label in torch.unique(batch):
++  indices=torch.where(batch==label)[0];p=x[indices];count=int(torch.ceil(torch.tensor(len(p),dtype=torch.float32)*ratio));selected=0;distance=((p-p[0])**2).sum(1);result.append(int(indices[0]))
++  for _ in range(1,count):
++   selected=int(distance.argmax());result.append(int(indices[selected]));distance=torch.minimum(distance,((p-p[selected])**2).sum(1))
++ return torch.tensor(result)
++cases=[];g=torch.Generator().manual_seed(42)
++inputs=[('known_line',torch.tensor([[0.,0.,0.],[1.,0.,0.],[2.,0.,0.],[3.,0.,0.]]),torch.zeros(4,dtype=torch.long),.75),('ties',torch.tensor([[0.,0.,0.],[1.,0.,0.],[-1.,0.,0.],[0.,1.,0.],[0.,-1.,0.]]),torch.zeros(5,dtype=torch.long),1.),('duplicates',torch.zeros(5,3),torch.zeros(5,dtype=torch.long),.6),('ceil_multibatch',torch.randn(12,3,generator=g),torch.tensor([0]*5+[1]*7),.4),('actual_encoder_count',torch.randn(4096,3,generator=g),torch.zeros(4096,dtype=torch.long),.25)]
++for name,x,batch,ratio in inputs:
++ start=time.perf_counter();actual=fps(x,batch,ratio);elapsed=time.perf_counter()-start;expected=reference(x,batch,ratio);assert torch.equal(actual,expected),(name,actual,expected)
++ cases.append(dict(name=name,input_points=len(x),output_points=len(actual),exact_indices=True,seconds=elapsed));print('PASS',cases[-1],flush=True)
++assert fps(inputs[0][1],inputs[0][2],.75).tolist()==[0,3,1]
++Path('../unirig-evidence/fps-cpu.json').write_text(json.dumps(dict(native_extension_executed=False,reference_source='https://github.com/rusty1s/pytorch_cluster/blob/master/csrc/cpu/fps_cpu.cpp',cases=cases),indent=2))
+diff --git a/test_strict_load.py b/test_strict_load.py
+new file mode 100644
+index 0000000..e0e746b
+--- /dev/null
++++ b/test_strict_load.py
+@@ -0,0 +1,10 @@
++import json,resource,sys
++from pathlib import Path
++import torch
++from ar_runtime import load_ar_model
++
++torch.set_num_threads(2)
++m,info=load_ar_model();info.update(max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,all_parameters_finite=all(torch.isfinite(p).all().item() for p in m.parameters()),all_parameters_cpu_fp32=all(p.device.type=='cpu' and p.dtype==torch.float32 for p in m.parameters()))
++assert info['all_parameters_finite'] and info['all_parameters_cpu_fp32'];assert info['transformer_attention']=='sdpa'
++for name in ['spconv','torch_scatter','flash_attn','torch_cluster']:assert not any(x==name or x.startswith(name+'.') for x in sys.modules),name
++Path('../unirig-evidence/strict-load.json').write_text(json.dumps(info,indent=2));print(info,flush=True)
+diff --git a/test_ar_forward_cpu.py b/test_ar_forward_cpu.py
+new file mode 100644
+index 0000000..3c2f6b2
+--- /dev/null
++++ b/test_ar_forward_cpu.py
+@@ -0,0 +1,10 @@
++"""CPU shape/finite smoke with small conditioning, no anatomy qualification."""
++import json,time,resource
++from pathlib import Path
++import torch
++from ar_runtime import load_ar_model
++
++torch.set_num_threads(2);torch.manual_seed(1234);m,load=load_ar_model();x=torch.randn(256,3)*.25;n=torch.nn.functional.normalize(torch.randn(256,3),dim=1);start=torch.tensor([[m.tokenizer.bos,m.tokenizer.cls_name_to_token('articulationxl')]])
++with torch.inference_mode():
++ t=time.perf_counter();cond=m.encode_mesh_cond(x,n);encoder_seconds=time.perf_counter()-t;embeds=torch.cat([cond,m.transformer.get_input_embeddings()(start)],1);t=time.perf_counter();logits=m.transformer(inputs_embeds=embeds,logits_to_keep=1).logits;prefill_seconds=time.perf_counter()-t
++assert torch.isfinite(cond).all() and torch.isfinite(logits).all();r=dict(conditioning_points=256,encoder_shape=list(cond.shape),logit_shape=list(logits.shape),encoder_seconds=encoder_seconds,prefill_seconds=prefill_seconds,all_finite=True,max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,top5=torch.topk(logits[0,-1],5).indices.tolist(),note='Small random conditioning shape/finite check only; no actual mesh/anatomy result.');Path('../unirig-evidence/ar-forward-cpu.json').write_text(json.dumps(r,indent=2));print(r,flush=True)

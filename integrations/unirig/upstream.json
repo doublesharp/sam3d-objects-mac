@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/VAST-AI-Research/UniRig.git",
+  "revision": "6793c6640ff01c8fb389f3993434124bb43d2933",
+  "patch_sha256": "2314e15cf1873d69acab3ae3ffc97997397f62b05c225cb9de51fa61bdad4362",
+  "scope": "experimental inference only; anatomical qualification required"
+}
