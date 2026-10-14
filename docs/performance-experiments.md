@@ -15,6 +15,12 @@ faces remain distinct. Finite geometry, indices, winding and UV checks still run
 Changed geometry and existing files use full validation. Certificates are not
 persisted or trusted from metadata.
 
+## Headless generation startup
+
+Notebook plotting, Gradio UI, and scene-composition dependencies load when their
+corresponding visualization helper is called. Command-line inference imports its
+core image and model dependencies directly.
+
 ## Generation attention cache
 
 Eligible attention layers cache immutable conditioning K/V within one pipeline

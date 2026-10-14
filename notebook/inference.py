@@ -16,31 +16,14 @@ import math
 import utils3d
 import shutil
 import subprocess
-import seaborn as sns
 from PIL import Image
 import numpy as np
-import gradio as gr
-import matplotlib.pyplot as plt
 from copy import deepcopy
 import builtins
-# kaolin / pytorch3d are optional (only used for notebook video rendering)
-try:
-    from kaolin.visualize import IpyTurntableVisualizer
-    from kaolin.render.camera import Camera, CameraExtrinsics, PinholeIntrinsics
-    _KAOLIN_VIZ = True
-except Exception:
-    _KAOLIN_VIZ = False
-try:
-    from pytorch3d.transforms import quaternion_multiply, quaternion_invert
-    _P3D = True
-except Exception:
-    _P3D = False
-
 import sam3d_objects  # REMARK(Pierre) : do not remove this import
 from sam3d_objects.pipeline.inference_pipeline_pointmap import InferencePipelinePointMap
 from sam3d_objects.model.backbone.tdfy_dit.utils import render_utils
 
-from sam3d_objects.utils.visualization import SceneVisualizer
 
 __all__ = ["Inference"]
 
@@ -282,6 +265,9 @@ def normalized_gaussian(scene_gs, in_place=False, outlier_percentile=None):
 
 
 def make_scene(*outputs, in_place=False):
+    from sam3d_objects.utils.visualization import SceneVisualizer
+    from pytorch3d.transforms import quaternion_multiply, quaternion_invert
+
     if not in_place:
         outputs = [deepcopy(output) for output in outputs]
 
@@ -408,6 +394,9 @@ def load_masks(folder_path, indices_list=None, extension=".png"):
 
 
 def display_image(image, masks=None):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
     def imshow(image, ax):
         ax.axis("off")
         ax.imshow(image)
@@ -434,6 +423,8 @@ def display_image(image, masks=None):
 
 
 def interactive_visualizer(ply_path):
+    import gradio as gr
+
     with gr.Blocks() as demo:
         gr.Markdown("# 3D Gaussian Splatting (black-screen loading might take a while)")
         gr.Model3D(
