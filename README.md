@@ -35,8 +35,9 @@ or in their consuming project's repository.
 - **~12 GB** free disk for the model weights + working memory headroom.
 - Python 3.11.
 
-Memory is the main constraint: the pipeline is memory-heavy and runs **one stage
-at a time** on purpose (see *How it works*). Quit other GPU-hungry apps (browsers,
+Memory is the main constraint. Single-image runs and low-memory folder batches
+run one stage at a time. Eligible high-memory folder batches overlap one generator
+with one CPU exporter (see *How it works*). Quit other GPU-hungry apps (browsers,
 Ollama, etc.) before a run — memory pressure is the usual cause of a failed
 (all-NaN) result.
 
@@ -133,7 +134,7 @@ That's the whole thing. It asks for the source image(s), output folder, and
 quality, then runs end to end:
 
 1. **Images** — choose a single ordinary photo, multiple views of the same
-   object, or a folder of images for a sequential overnight batch. The first
+   object, or a folder of images for an overnight batch. The first
    multi-view image is the primary geometry/depth view; the other views are
    extra conditioning references. The background is removed automatically
    (rembg); you do **not** need to pre-extract the object.
@@ -329,11 +330,36 @@ SAM3D_CPU_DECODE_VOXELS=50000 ./run.sh game outputs/<name> 1600
 
 ## How it works
 
-The run is split across **separate OS processes** so that only one memory-heavy
-stage is ever resident — macOS only reclaims a process's GPU memory when it
-exits. Single-image runs exit the CLI before GLB conversion. Folder batches
-spawn one fresh splat worker per image, collect successful outputs, then run the
-GLB conversions afterwards.
+The run uses **separate OS processes** so each generation worker releases its
+model memory on exit. Single-image runs exit the CLI before GLB conversion.
+Folder batches use one fresh generation worker per image. In the full `./run.sh`
+flow, direct Gaussian texture batches can overlap one generator with one CPU
+exporter when physical RAM is at least 64 GiB and available RAM is at least
+32 GiB. At most one completed generation waits for export; only the generator
+uses the accelerator. Export mesh decoding and Gaussian loading run on CPU.
+
+Overlap requires surface repair enabled and automatic or CPU export/mesh device
+selection. `SAM3D_SURFACE_REPAIR=0` selects serial because legacy hole cleanup
+can use the accelerator. Other texture modes, explicit accelerator export
+settings, unknown memory, and smaller hosts
+use the serial flow. `SAM3D_PIPELINED_BATCH=0 ./run.sh` always selects serial.
+Available memory is checked again before overlapping a new generation. If it
+falls below the threshold, the exporter finishes before the next generation;
+the scheduler does not wait for memory while holding both stages.
+
+The overlapping exporter uses two PyTorch/BLAS threads, one interop thread and
+two Gaussian KD-tree workers. Normal repair distance keeps its existing thread
+budget. Requested source-only/complete output, game settings, repair and texture
+profiles remain in effect. Generation artifacts survive export failures; the
+batch logs failures, continues, and returns a failing exit status. A run-specific
+export marker prevents the shell from exporting completed or failed items twice.
+Direct `python cli.py` still generates only.
+
+`SAM3D_EXPORT_DEVICE=cpu` explicitly selects CPU Gaussian loading and rendering
+for standalone exports. Valid settings are `auto` (default), `cpu`, `mps`, and
+`cuda`; unavailable devices or invalid values raise an error. See
+[performance behavior](docs/performance-experiments.md) for the integrated CPU
+and attention changes and their limits.
 
 ```
  ┌── Stage 1: cli.py ───────────────┐        ┌── Stage 2: ply2glb.py ───────┐

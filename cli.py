@@ -534,10 +534,64 @@ def _run_batch_worker(args):
         return 1
 
 
+def _run_pipelined_folder_batch(jobs, batch_root, steps):
+    import json
+    from batch_scheduler import run_batch, overlap_eligible
+    used_names = set()
+    scheduled = []
+    directories = {}
+    for idx, job in enumerate(jobs, start=1):
+        obj_dir = _child_output_dir(batch_root, job["paths"][0], used_names)
+        name = f"{idx}/{len(jobs)} — {job['name']}"
+        directories[name] = obj_dir
+        scheduled.append(dict(name=name, generate=[sys.executable, os.path.abspath(__file__),
+            "--batch-worker", "--image", job["paths"][0], "--output-dir", obj_dir,
+            "--steps", str(steps)], export=[sys.executable, os.path.join(ROOT, "ply2glb.py"), obj_dir]))
+    ok("Bounded batch: one generator plus one CPU exporter; pending output limit 1")
+
+    def record(result):
+        obj_dir = directories[result["name"]]
+        if result["generation"] == 0:
+            # Read the worker's progress counters without changing its manifest format.
+            marker = dict(result, run_token=os.environ.get("SAM3D_MANIFEST"))
+            with open(os.path.join(obj_dir, ".sam3d-batch-export.json"), "w") as stream:
+                json.dump(marker, stream)
+        failed_stage = "generation" if result["generation"] != 0 else "export" if result["export"] != 0 else None
+        if failed_stage:
+            message = f"{failed_stage} exited with status {result[failed_stage]}"
+            warn(f"{result['name']}: {message}; continuing")
+            _append_batch_failure(batch_root, result["name"], message)
+        else:
+            ok(f"Completed generation and export for {result['name']}")
+
+    # Export reads progress from the successful generation manifest just before spawn.
+    def completed_export_env(job):
+        manifest = os.environ.get("SAM3D_MANIFEST")
+        if not manifest:
+            return {}
+        with open(manifest) as stream:
+            for line in stream:
+                columns = line.rstrip("\n").split("\t")
+                if columns[0] == job["export"][-1] and len(columns) >= 3:
+                    return {"SAM3D_PROGRESS_DONE": columns[1], "SAM3D_PROGRESS_TOTAL": columns[2]}
+        return {}
+
+    results = run_batch(scheduled, overlap=True, on_result=record,
+                        memory_check=overlap_eligible, export_env_factory=completed_export_env)
+    failures = sum(result["generation"] != 0 or result["export"] != 0 for result in results)
+    hdr("BATCH SUMMARY")
+    ok(f"Succeeded: {len(results) - failures}; failed: {failures}")
+    return failures == 0
+
+
 def _run_folder_batch(jobs, batch_root, steps):
     hdr("BATCH QUEUE")
-    ok(f"{len(jobs)} image(s) will run sequentially")
     ok(f"Batch root: {batch_root}")
+    if os.environ.get("SAM3D_FULL_BATCH") == "1":
+        from batch_scheduler import overlap_eligible
+        if overlap_eligible():
+            return _run_pipelined_folder_batch(jobs, batch_root, steps)
+    ok(f"{len(jobs)} image(s) will run sequentially")
     failures = []
     used_names = set()
     for idx, job in enumerate(jobs, start=1):
@@ -595,9 +649,9 @@ def main():
     steps = get_steps()
 
     if batch_mode:
-        _run_folder_batch(jobs, obj_dir, steps)
+        success = _run_folder_batch(jobs, obj_dir, steps)
         hdr("ALL DONE")
-        return
+        return 0 if success else 1
 
     image_views = _materialize_job_views(jobs[0])
     # Always extract every supplied view: find the largest foreground component
@@ -612,4 +666,8 @@ if __name__ == "__main__":
     worker_args = _parse_worker_args(sys.argv[1:])
     if worker_args is not None:
         sys.exit(_run_batch_worker(worker_args))
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        err("Interrupted")
+        sys.exit(130)

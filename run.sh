@@ -130,20 +130,25 @@ echo "────────────────────────�
 echo "  STAGE 1/2 — SPLAT GENERATION"
 echo "──────────────────────────────────────────────"
 # cli.py records successful output dirs into $SAM3D_MANIFEST. For folder batches
-# it spawns one fresh worker per image, then exits before the GLB step starts.
-SAM3D_MANIFEST="$MANIFEST" "$PY" "$SCRIPT_DIR/cli.py"
+# eligible full folder runs also finish bounded CPU exports inside the CLI.
+set +e
+SAM3D_FULL_BATCH=1 SAM3D_MANIFEST="$MANIFEST" "$PY" "$SCRIPT_DIR/cli.py"
+cli_status=$?
+set -e
+if (( cli_status == 130 )); then
+    rm -f "$MANIFEST"
+    exit 130
+fi
 
 if [[ ! -s "$MANIFEST" ]]; then
     echo "  No splat output recorded (aborted or NaN) — nothing to convert."
     rm -f "$MANIFEST"
-    exit 0
+    exit "$cli_status"
 fi
 
 echo "──────────────────────────────────────────────"
 echo "  CLI finished & exited — its memory is now freed"
 echo "──────────────────────────────────────────────"
-wait_for_memory 12
-
 echo "──────────────────────────────────────────────"
 echo "  STAGE 2/2 — GLB CONVERSION"
 echo "──────────────────────────────────────────────"
@@ -168,7 +173,19 @@ run_conversion() {
 
 while IFS=$'\t' read -r objdir progress_done progress_total _export_mode _game_target _game_method; do
     [[ -z "$objdir" ]] && continue
-    wait_for_memory 12          # cheap if already free; guards multi-object runs
+    # A run-specific marker covers success AND failure: never retry an export here.
+    set +e
+    "$PY" -c 'import json,sys,os; p=os.path.join(sys.argv[1],".sam3d-batch-export.json"); r=json.load(open(p)) if os.path.isfile(p) else {}; sys.exit(0 if r.get("run_token")==sys.argv[2] and r.get("export")==0 else 2 if r.get("run_token")==sys.argv[2] else 3)' "$objdir" "$MANIFEST"
+    marker_status=$?
+    set -e
+    if (( marker_status == 0 )); then
+        glb_successes=$((glb_successes + 1))
+        continue
+    elif (( marker_status == 2 )); then
+        glb_failures=$((glb_failures + 1))
+        continue
+    fi
+    wait_for_memory 12          # cheap if already free; guards serial exports
     echo "  → $objdir"
     run_conversion "$objdir" env \
         SAM3D_PROGRESS_DONE="${progress_done:-0}" \
@@ -181,4 +198,8 @@ if (( glb_failures > 0 )); then
     echo "  Finished with ${glb_successes} GLB export(s) and ${glb_failures} failure(s)."
 else
     echo "  All done."
+fi
+
+if (( glb_failures > 0 || cli_status != 0 )); then
+    exit 1
 fi

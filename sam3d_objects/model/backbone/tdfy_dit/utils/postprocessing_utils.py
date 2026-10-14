@@ -2093,6 +2093,7 @@ def to_glb(
                 splat_scales,
                 splat_rotations,
                 texture_size=texture_size,
+                workers=int(os.environ.get("SAM3D_GAUSSIAN_KD_WORKERS", "-1")),
             )
             _emit_progress(progress_callback, "Gaussian surface color bake", 3)
         elif texture_mode == "average" and isinstance(app_rep, Gaussian):

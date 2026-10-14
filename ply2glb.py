@@ -51,6 +51,32 @@ def bool_env(name, default=True):
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+def choose_export_device():
+    requested = os.environ.get("SAM3D_EXPORT_DEVICE", "auto").strip().lower()
+    if requested not in ("auto", "cpu", "mps", "cuda"):
+        raise ValueError("SAM3D_EXPORT_DEVICE must be auto, cpu, mps, or cuda")
+    if requested == "mps" and not torch.backends.mps.is_available():
+        raise ValueError("SAM3D_EXPORT_DEVICE=mps is unavailable")
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise ValueError("SAM3D_EXPORT_DEVICE=cuda is unavailable")
+    if requested != "auto":
+        return requested
+    return "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+
+def configure_export_threads():
+    for name, setter in (("SAM3D_EXPORT_THREADS", torch.set_num_threads),
+                         ("SAM3D_EXPORT_INTEROP_THREADS", torch.set_num_interop_threads)):
+        if name in os.environ:
+            try:
+                value = int(os.environ[name])
+            except ValueError:
+                raise ValueError(f"{name} must be a positive integer") from None
+            if value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+            setter(value)
+
+
 def texture_size_for_profile(profile):
     defaults = {'preview': 2048, 'final': 4096}
     if profile not in defaults:
@@ -418,11 +444,8 @@ def main():
     if should_write_source_glb and not os.path.isfile(slat_path):
         err(f"slat.pt not found in {folder} — re-run the CLI to regenerate (it now saves slat.pt)")
 
-    render_device = (
-        "mps" if torch.backends.mps.is_available() and not torch.cuda.is_available()
-        else "cuda" if torch.cuda.is_available()
-        else "cpu"
-    )
+    configure_export_threads()
+    render_device = choose_export_device()
     ok(f"Device: {render_device}")
     ok("Pipeline: detailed mesh.glb/.obj" if source_only else "Pipeline: mesh.glb → mesh.obj → mesh_game.glb/.obj + texture/normal")
     ok(f"Game vertex target: {target_vertices or 'auto (2k-10k)'}")

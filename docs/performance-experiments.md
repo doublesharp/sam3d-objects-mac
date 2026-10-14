@@ -24,6 +24,34 @@ only. Every query, attention operation and output projection runs afresh,
 including single-token conditioning and non-finite queries. These changes do not change sampler seeds, steps or generation
 profiles.
 
+## Folder overlap
+
+The full `./run.sh` folder flow automatically overlaps one fresh generator and
+one CPU exporter for direct Gaussian textures on hosts with at least 64 GiB RAM
+and 32 GiB currently available, with surface repair enabled. Disabling repair
+selects serial because legacy hole cleanup can use the accelerator. Unknown
+memory and explicit MPS/CUDA export settings fall back to serial. A completed-generation queue holds at most one
+item. A new overlap is suspended under low available memory; export drains and
+the next item runs serially without a memory wait inside the scheduler.
+
+Use `SAM3D_PIPELINED_BATCH=0 ./run.sh` to select serial. Standalone `cli.py` is
+unchanged: it generates splats and latents without export. Other texture modes
+retain the serial flow and their existing device settings.
+
+Overlapping export forces `SAM3D_EXPORT_DEVICE=cpu` and
+`SAM3D_MESH_DECODE_DEVICE=cpu`. It uses two PyTorch and BLAS threads, one PyTorch
+interop thread, and two Gaussian KD-tree workers. Standalone export retains its
+normal resource defaults; optional `SAM3D_EXPORT_THREADS`,
+`SAM3D_EXPORT_INTEROP_THREADS`, and `SAM3D_GAUSSIAN_KD_WORKERS` expose those budgets.
+The thread settings require positive integers; KD workers also accepts `-1`.
+Normal repair-distance threads retain their existing budget.
+
+Profiles, source-only/complete output, texture settings and game targets are
+inherited. Failure records preserve successful generation files. Failed items
+are logged and later items continue; the runner returns failure if any stage
+failed. Ctrl-C terminates and reaps both child process groups. Run-specific export
+markers prevent the shell from duplicating an export.
+
 ## Native CPU benchmarks
 
 The scripts in benchmarks/benchmark_native_indexing.py and
