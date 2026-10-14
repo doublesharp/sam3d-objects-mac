@@ -1,0 +1,547 @@
+diff --git a/src/model/michelangelo/utils/misc.py b/src/model/michelangelo/utils/misc.py
+index 2174de3..7056db4 100755
+--- a/src/model/michelangelo/utils/misc.py
++++ b/src/model/michelangelo/utils/misc.py
+@@ -120,7 +120,7 @@ def get_free_space(path):
+     return free_space
+ 
+ def get_device_type():
+-    return torch.cuda.get_device_name(0)
++    return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "non-CUDA"
+ 
+ def get_hostname():
+     import socket
+diff --git a/src/model/skin_vae/attention_processor.py b/src/model/skin_vae/attention_processor.py
+index b28b899..4f0e15e 100755
+--- a/src/model/skin_vae/attention_processor.py
++++ b/src/model/skin_vae/attention_processor.py
+@@ -10,21 +10,7 @@ from diffusers.utils.import_utils import is_torch_npu_available, is_xformers_ava
+ from diffusers.utils.torch_utils import is_torch_version, maybe_allow_in_graph
+ from torch import nn
+ 
+-try:
+-    from flash_attn_interface import flash_attn_func
+-except Exception as e:
+-    def flash_attn_func(q, k, v):
+-        q = q.permute(0, 2, 1, 3)  # (B, H, L, D)
+-        k = k.permute(0, 2, 1, 3)
+-        v = v.permute(0, 2, 1, 3)
+-
+-        if q.shape[1] != k.shape[1]:
+-            repeat_factor = q.shape[1] // k.shape[1]
+-            k = k.repeat_interleave(repeat_factor, dim=1)
+-            v = v.repeat_interleave(repeat_factor, dim=1)
+-
+-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+-        return out.permute(0, 2, 1, 3), None  # (B, L, H, D)
++from ..portable_attention import flash_attn_func
+ 
+ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+ 
+diff --git a/src/model/skin_vae/autoencoders/miche_transformer_blocks.py b/src/model/skin_vae/autoencoders/miche_transformer_blocks.py
+index 97874e6..4a4be14 100755
+--- a/src/model/skin_vae/autoencoders/miche_transformer_blocks.py
++++ b/src/model/skin_vae/autoencoders/miche_transformer_blocks.py
+@@ -77,13 +77,7 @@ class CheckpointFunction(torch.autograd.Function):
+         del output_tensors
+         return (None, None) + input_grads
+ 
+-try:
+-    from flash_attn_interface import flash_attn_func
+-    print("use flash attention 3.")
+-    _use_flash3 = True
+-except:
+-    print("use flash attention 2.")
+-    _use_flash3 = False
++from ...portable_attention import flash_attn_func
+ 
+ def init_linear(l, stddev):
+     nn.init.normal_(l.weight, std=stddev)
+@@ -91,34 +85,7 @@ def init_linear(l, stddev):
+         nn.init.constant_(l.bias, 0.0)
+ 
+ def flash_attention(q, k, v):
+-    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=False):
+-        if _use_flash3:
+-            out, _ = flash_attn_func(q.contiguous(), k.contiguous(), v.contiguous())
+-            # out = flash_attn_func(q, k, v)
+-
+-            # q_ = q.transpose(1, 2)
+-            # k_ = k.transpose(1, 2)
+-            # v_ = v.transpose(1, 2)
+-
+-            # # print(q.shape, k.shape, v.shape)
+-            # out_ = F.scaled_dot_product_attention(q_, k_, v_)
+-            # out_ = out_.transpose(1, 2)
+-
+-            # # print(torch.abs(out - out_).mean())
+-            # assert torch.abs(out - out_).mean() < 1e-2, f"the error {torch.abs(out - out_).mean()} is  too large"
+-
+-            # out = out_
+-
+-            # print("use flash_atten 3")
+-        else:
+-            q = q.transpose(1, 2)
+-            k = k.transpose(1, 2)
+-            v = v.transpose(1, 2)
+-            out = F.scaled_dot_product_attention(q, k, v)
+-            out = out.transpose(1, 2)
+-            # print("use flash atten 2")
+-
+-    return out
++    return flash_attn_func(q, k, v)[0]
+ 
+ class MultiheadAttention(nn.Module):
+     def __init__(
+diff --git a/src/model/skin_vae_model.py b/src/model/skin_vae_model.py
+index a2b4e88..d3384d8 100755
+--- a/src/model/skin_vae_model.py
++++ b/src/model/skin_vae_model.py
+@@ -15,13 +15,7 @@ from src.rig_package.info.asset import Asset
+ from .spec import ModelSpec, ModelInput, VaeInput
+ from .skin_vae.autoencoders import SkinFSQCVAEModel
+ 
+-try:
+-    from flash_attn_interface import flash_attn_func # type: ignore
+-except Exception as e:
+-    from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func
+-    def flash_attn_func(*args, **kwargs):
+-        res = _flash_attn_func(*args, **kwargs)
+-        return res, None
++from .portable_attention import flash_attn_func
+ 
+ class Perceiver(nn.Module):
+     def __init__(self, channels, out_tokens, num_heads=8):
+@@ -136,7 +130,7 @@ class SkinVAEModel(ModelSpec):
+             uniform_skin=uniform_skin,
+         )
+     
+-    @torch.autocast(device_type='cuda', dtype=torch.bfloat16)
++    @torch.no_grad()
+     def training_step(self, batch: Dict) -> Dict:
+         raise NotImplementedError()
+     
+@@ -171,7 +165,7 @@ class SkinVAEModel(ModelSpec):
+     def forward(self, batch: Dict) -> Dict:
+         return self.training_step(batch=batch)
+ 
+-    @torch.autocast('cuda', dtype=torch.bfloat16)
++    @torch.no_grad()
+     def predict_step(self, batch: Dict) -> Dict:
+         vertices: Tensor = batch['vertices'].float() # (B, N, 3)
+         num_bones: List[int] = batch['num_bones']
+diff --git a/src/model/tokenrig.py b/src/model/tokenrig.py
+index ab35e3f..c9f9cee 100755
+--- a/src/model/tokenrig.py
++++ b/src/model/tokenrig.py
+@@ -1,8 +1,10 @@
+ from copy import deepcopy
++from types import MethodType
+ from pathlib import Path
+ from torch import nn, Tensor, FloatTensor
+ from torch.nn.functional import pad
+ from transformers import AutoModelForCausalLM, AutoConfig, LogitsProcessor, LogitsProcessorList # type: ignore
++from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
+ from typing import Dict, List, Tuple
+ 
+ import math
+@@ -22,13 +24,34 @@ from ..tokenizer.spec import Tokenizer
+ from ..tokenizer.spec import DetokenizeOutput
+ from ..tokenizer.parse import get_tokenizer
+ 
+-try:
+-    from flash_attn_interface import flash_attn_func # type: ignore
+-except Exception as e:
+-    from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func
+-    def flash_attn_func(*args, **kwargs):
+-        res = _flash_attn_func(*args, **kwargs)
+-        return res, None
++from .portable_attention import flash_attn_func
++
++class EmptyHistorySafeRepetitionPenalty(RepetitionPenaltyLogitsProcessor):
++    def __call__(self, input_ids: Tensor, scores: FloatTensor) -> FloatTensor:
++        # inputs_embeds generation has no token history on its first step.
++        # MPS scatter with an empty index returns uninitialized output here.
++        history = input_ids[:, self.prompt_ignore_length:] if self.prompt_ignore_length else input_ids
++        if history.numel() == 0:
++            return scores
++        return super().__call__(input_ids, scores)
++
++def install_empty_history_repetition_guard(transformer):
++    """Replace resolved stock penalties in place, on this model only."""
++    if getattr(transformer, '_skintokens_generation_guard_installed', False):
++        return
++    original = transformer._get_logits_processor.__func__
++
++    def guarded(self, *args, **kwargs):
++        processors = original(self, *args, **kwargs)
++        for index, processor in enumerate(processors):
++            if type(processor) is RepetitionPenaltyLogitsProcessor:
++                replacement = EmptyHistorySafeRepetitionPenalty(processor.penalty)
++                replacement.__dict__.update(processor.__dict__)
++                processors[index] = replacement
++        return processors
++
++    transformer._get_logits_processor = MethodType(guarded, transformer)
++    transformer._skintokens_generation_guard_installed = True
+ 
+ class VocabSwitchingLogitsProcessor(LogitsProcessor):
+     def __init__(self, tokenizer: Tokenizer, switch_token_id, eos_token_id, tokens_per_skin, init):
+@@ -46,10 +69,10 @@ class VocabSwitchingLogitsProcessor(LogitsProcessor):
+             sequence = torch.cat([self.init, sequence])
+             length = len(sequence)
+             if self.switch_token_id in sequence:
+-                mask[self.switch_token_id:] = 0
++                mask[self.tokenizer.vocab_size:] = 0
+                 where = torch.where(sequence == self.switch_token_id)[0][:1]
+                 J = self.tokenizer.bones_in_sequence(ids=sequence.detach().cpu().numpy())
+-                if (length-where) == J*self.tokens_per_skin:
++                if (length-where-1) == J*self.tokens_per_skin:
+                     mask[:] = float('-inf')
+                     mask[self.eos_token_id] = 0
+                 else:
+@@ -106,7 +129,8 @@ class TokenRig(ModelSpec):
+         llm_config.torch_dtype = torch.bfloat16
+         llm_config.pre_norm = True
+         self.llm_config = llm_config
+-        self.transformer = AutoModelForCausalLM.from_config(config=llm_config, attn_implementation="flash_attention_2").to(torch.bfloat16)
++        self.transformer = AutoModelForCausalLM.from_config(config=llm_config, attn_implementation="sdpa").to(torch.bfloat16)
++        install_empty_history_repetition_guard(self.transformer)
+         
+         self.output_proj = nn.Sequential(
+             nn.Linear(self.mesh_encoder.width, self.hidden_size),
+@@ -147,7 +171,7 @@ class TokenRig(ModelSpec):
+         rate = (self.global_step-start_steps) / (end_steps-start_steps)
+         return min(max((1.0-math.cos(math.pi * rate))/2, 0), 1)
+ 
+-    @torch.autocast(device_type='cuda', dtype=torch.bfloat16)
++    @torch.no_grad()
+     def training_step(self, batch: Dict) -> Dict:
+         raise NotImplementedError()
+     
+@@ -191,7 +215,7 @@ class TokenRig(ModelSpec):
+             start_tokens_list.append(start_tokens)
+         return start_tokens_list
+     
+-    @torch.autocast(device_type='cuda', dtype=torch.bfloat16)
++    @torch.no_grad()
+     def generate(
+         self,
+         vertices: Tensor,
+@@ -202,6 +226,7 @@ class TokenRig(ModelSpec):
+         return_decode_dict: bool=False,
+         num_joints: int|None=None,
+         parents: Tensor|None=None,
++        conditioning_seed: int|None=None,
+         **kwargs,
+     ) -> TokenRigResult:
+         """
+@@ -220,6 +245,7 @@ class TokenRig(ModelSpec):
+             cond=cond,
+             num_tokens=self.tokens_per_skin,
+             cond_tokens=self.tokens_skin_cond,
++            seed=conditioning_seed,
+             return_z=False,
+         )
+         assert cond_latents is not None
+@@ -663,4 +689,4 @@ def decode_multi(
+     for (i, id) in enumerate(oks):
+         skin_pred = skin[:, batch_mapping==id].reshape(-1, oks_J[i])
+         res[id]['skin_pred'] = skin_pred.detach().cpu().numpy() if is_numpy else skin_pred
+-    return res
+\ No newline at end of file
++    return res
+diff --git a/src/model/portable_attention.py b/src/model/portable_attention.py
+new file mode 100644
+index 0000000..1fd4c22
+--- /dev/null
++++ b/src/model/portable_attention.py
+@@ -0,0 +1,16 @@
++"""Research-only replacement for the FlashAttention BLHD interface."""
++import torch
++import torch.nn.functional as F
++
++def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, **kwargs):
++    if kwargs:
++        raise TypeError(f'Unsupported FlashAttention options: {sorted(kwargs)}')
++    q, k, v = (t.transpose(1, 2) for t in (q, k, v))
++    if q.shape[1] != k.shape[1]:
++        if q.shape[1] % k.shape[1]:
++            raise ValueError('Query heads must be divisible by key heads')
++        repeat = q.shape[1] // k.shape[1]
++        k, v = (t.repeat_interleave(repeat, dim=1) for t in (k, v))
++    out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p,
++                                          is_causal=causal, scale=softmax_scale)
++    return out.transpose(1, 2), None
+diff --git a/run_local.py b/run_local.py
+new file mode 100644
+index 0000000..ee19e12
+--- /dev/null
++++ b/run_local.py
+@@ -0,0 +1,96 @@
++"""Research evaluation only. Generated learned skeleton, no anatomical templates."""
++import argparse, hashlib, json, os, resource, time, traceback, threading
++from pathlib import Path
++import numpy as np
++import torch
++import trimesh
++from scipy.spatial import cKDTree
++from src.model.tokenrig import TokenRig, decode
++from src.tokenizer.spec import TokenizeInput
++from src.model.portable_attention import flash_attn_func
++from rig_validation import validate_skeleton,validate_rig,validate_override
++
++p=argparse.ArgumentParser();p.add_argument('--input',required=True);p.add_argument('--output',required=True);p.add_argument('--device',default='mps');p.add_argument('--dtype',default='bfloat16');p.add_argument('--samples',type=int,default=2048);p.add_argument('--threads',type=int,default=6);p.add_argument('--beams',type=int,default=1);p.add_argument('--skeleton');p.add_argument('--full-quality',action='store_true');p.add_argument('--gltf-to-blender',action='store_true');p.add_argument('--seed',type=int,default=1234);p.add_argument('--max-new-tokens',type=int,default=2040);p.add_argument('--max-time',type=float,default=180.);a=p.parse_args()
++if a.device=='mps': torch.mps.set_per_process_memory_fraction(.45)
++out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
++r=dict(input=a.input,device=a.device,dtype=a.dtype,samples=a.samples,beams=a.beams,threads=a.threads,max_new_tokens=a.max_new_tokens,max_time=a.max_time,seed=a.seed,conditioning_seed=a.seed,status='running',automatic=a.skeleton is None,grammar_fix=True)
++start=time.perf_counter()
++monitor_done=threading.Event()
++def monitor():
++ while not monitor_done.is_set():
++  if a.device=='mps' and torch.backends.mps.is_available():
++   r['mps_allocated_peak_sampled_bytes']=max(r.get('mps_allocated_peak_sampled_bytes',0),torch.mps.current_allocated_memory())
++   r['mps_driver_peak_sampled_bytes']=max(r.get('mps_driver_peak_sampled_bytes',0),torch.mps.driver_allocated_memory())
++  monitor_done.wait(.1)
++threading.Thread(target=monitor,daemon=True).start()
++def save():
++ r['elapsed_seconds']=time.perf_counter()-start;r['max_rss_bytes']=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
++ (out/'result.json').write_text(json.dumps(r,indent=2))
++def sync():
++ if a.device=='mps':torch.mps.synchronize()
++def timed(name,fn):
++ sync();t=time.perf_counter();res=fn();sync();r[name+'_seconds']=time.perf_counter()-t;print(name,r[name+'_seconds'],flush=True);save();return res
++try:
++ torch.set_num_threads(a.threads);torch.manual_seed(a.seed);np.random.seed(a.seed)
++ scene=trimesh.load(a.input,force='scene',process=False);mesh=scene.to_geometry();r['input_vertices']=len(mesh.vertices);r['input_faces']=len(mesh.faces)
++ # Mesh is reduced only for model-conditioning, then skin is transferred to all source vertices.
++ proxy=mesh if a.full_quality else mesh.simplify_quadric_decimation(face_count=4096)
++ center=mesh.bounds.mean(axis=0);scale=np.ptp(mesh.bounds,axis=0).max()/2
++ if a.full_quality:
++  from src.rig_package.utils import sample_vertex_groups
++  points,normals,_=sample_vertex_groups(vertices=proxy.vertices,faces=proxy.faces,num_samples=54000,vertex_normals=proxy.vertex_normals,face_normals=proxy.face_normals,shuffle=True,same=True)
++ else:
++  points,face_index=trimesh.sample.sample_surface(proxy,a.samples,seed=a.seed);normals=proxy.face_normals[face_index]
++ source_points=points.copy();points=(points-center)/scale
++ basis=np.array([[1,0,0],[0,0,-1],[0,1,0]]) if a.gltf_to_blender else np.eye(3)
++ points=points@basis.T;normals=normals@basis.T
++ r['actual_points']=len(points);r['full_quality']=a.full_quality;r['gltf_to_blender']=a.gltf_to_blender;r['coordinate_basis']=basis.tolist()
++ r.update(proxy_vertices=len(proxy.vertices),proxy_faces=len(proxy.faces),normalization_center=center.tolist(),normalization_scale=float(scale))
++ dtype=getattr(torch,a.dtype)
++ model=timed('model_load',lambda:TokenRig.load_from_system_checkpoint('experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt').eval().to(a.device,dtype))
++ r.update(skeleton_eos=int(model.tokenizer.eos),skin_vocab_start=int(model.tokenizer.vocab_size),tokens_per_skin=int(model.tokens_per_skin));save()
++ skel_tokens=None
++ if a.skeleton:
++  sk=json.loads(Path(a.skeleton).read_text());validate_skeleton(sk['joints'],sk['parents']);r['override_supplied_joints']=sk['joints'];r['override_supplied_parents']=sk['parents']
++  normalized=((np.array(sk['joints'])-center)/scale)@basis.T
++  skel_tokens=model.tokenizer.tokenize(TokenizeInput(joints=normalized,parents=sk['parents'],cls='articulation',joint_names=sk.get('joint_names')))
++  r['override_tokenized_joints']=model.tokenizer.detokenize(skel_tokens).joints.tolist()
++ vertices=torch.tensor(points,device=a.device,dtype=dtype);normal_t=torch.tensor(normals,device=a.device,dtype=dtype)
++ with torch.inference_mode(),torch.autocast(a.device,dtype=dtype,enabled=dtype!=torch.float32):
++  res=timed('generation',lambda:model.generate(return_decode_dict=True,vertices=vertices,normals=normal_t,cls='articulation',skeleton_tokens=skel_tokens,conditioning_seed=a.seed,max_new_tokens=a.max_new_tokens,max_time=a.max_time,top_k=5,top_p=.95,temperature=1.,repetition_penalty=2.,num_return_sequences=1,num_beams=a.beams,do_sample=True))
++ np.save(out/'tokens.npy',res.output_ids.cpu().numpy())
++ ids=res.output_ids.cpu().numpy();r.update(tokens=len(ids),final_token=int(ids[-1]),tokens_eos=int(model.eos),skeleton_eos_present=bool(np.any(ids==model.tokenizer.eos)),global_eos_present=bool(np.any(ids==model.eos)));save()
++ with torch.inference_mode(),torch.autocast(a.device,dtype=dtype,enabled=dtype!=torch.float32):
++  decoded=timed('rig_decode',lambda:decode(cond=res.cond,cond_latents=res.cond_latents,inputs_ids=res.output_ids,tokenizer=model.tokenizer,tokens_per_skin=model.tokens_per_skin,vae=model.vae))
++ res.skin_pred=decoded['skin_pred'];res.detokenize_output=decoded['detokenize_output']
++ r['inference_seconds']=r['generation_seconds']+r['rig_decode_seconds']
++ r['tokens']=len(res.output_ids);r['tokens_eos']=int(model.eos);r['final_token']=int(res.output_ids[-1]);r['mps_allocated_bytes']=torch.mps.current_allocated_memory() if a.device=='mps' else None;r['mps_driver_bytes']=torch.mps.driver_allocated_memory() if a.device=='mps' else None
++ joints=(res.detokenize_output.joints@basis)*scale+center;parents=np.array(res.detokenize_output.parents,dtype=int)
++ r['decoded_joints']=len(joints)
++ all_ids=res.output_ids.cpu().numpy();np.save(out/'tokens.npy',all_ids)
++ skeleton_end=int(np.where(all_ids==model.tokenizer.eos)[0][0]);r['counted_skeleton_bones']=int(model.tokenizer.bones_in_sequence(all_ids));r['skin_token_count']=int(len(all_ids)-skeleton_end-2)
++ r['skin_tokens_valid']=bool(np.all((all_ids[skeleton_end+1:-1]>=model.tokenizer.vocab_size)&(all_ids[skeleton_end+1:-1]<model.eos)))
++ if int(all_ids[-1])!=model.eos or r['skin_token_count']!=len(joints)*model.tokens_per_skin or not r['skin_tokens_valid']:
++  np.savez_compressed(out/'skeleton-only.npz',joints=joints,parents=parents,vertices=mesh.vertices,faces=mesh.faces,tokens=all_ids)
++  raise RuntimeError(f'Invalid skin grammar: {r["skin_token_count"]} tokens for {len(joints)} joints, valid vocabulary {r["skin_tokens_valid"]}')
++ if res.skin_pred is None:
++  np.savez_compressed(out/'skeleton-only.npz',joints=joints,parents=parents,vertices=mesh.vertices,faces=mesh.faces,tokens=all_ids)
++  raise RuntimeError(f'Incomplete skin sequence: {r["skin_token_count"]} skin tokens for {len(joints)} decoded joints, expected {len(joints)*model.tokens_per_skin}')
++ skin=res.skin_pred.float().cpu().numpy();r['sample_skin_range']=[float(skin.min()),float(skin.max())]
++ distances,inds=cKDTree(source_points).query(mesh.vertices,k=8)
++ iw=1/(distances+1e-8);iw/=iw.sum(1,keepdims=True);weights=np.einsum('nk,nkj->nj',iw,skin[inds]);weights=np.maximum(weights,0);weights/=np.maximum(weights.sum(1,keepdims=True),1e-8)
++ if a.skeleton:
++  r['override_model_quantization_max_error']=float(np.max(np.abs(joints-np.array(sk['joints']))));joints=np.array(sk['joints'],dtype=float)
++  r['override_parents_retained']=bool(np.array_equal(parents,sk['parents']));validate_override(joints,parents,sk['joints'],sk['parents'])
++ validate_rig(joints,parents,weights,len(mesh.vertices))
++ roots=np.where(parents<0)[0];hierarchy=len(roots)==1
++ for i in range(len(parents)):
++  seen=set();j=i
++  while j>=0:
++   if j>=len(parents) or j in seen:hierarchy=False;break
++   seen.add(j);j=int(parents[j])
++ r.update(joints=len(joints),roots=roots.tolist(),valid_hierarchy=bool(hierarchy),joints_finite=bool(np.isfinite(joints).all()),weights_finite=bool(np.isfinite(weights).all()),weights_sum_max_error=float(np.max(np.abs(weights.sum(1)-1))),nonzero_influences_mean=float((weights>1e-4).sum(1).mean()))
++ np.savez_compressed(out/'rig.npz',joints=joints,parents=parents,weights=weights,vertices=mesh.vertices,faces=mesh.faces,sampled_points=source_points,sample_weights=skin,tokens=res.output_ids.cpu().numpy())
++ r['status']='inference_passed';monitor_done.set();save()
++except Exception as e:
++ monitor_done.set();r['status']='failed';r['error']=repr(e);r['traceback']=traceback.format_exc();save();raise
+diff --git a/rig_validation.py b/rig_validation.py
+new file mode 100644
+index 0000000..f1b9dae
+--- /dev/null
++++ b/rig_validation.py
+@@ -0,0 +1,25 @@
++"""Failure-rejecting research candidate and exact-override validation."""
++import numpy as np
++
++def validate_skeleton(joints, parents):
++ joints=np.asarray(joints);raw_parents=np.asarray(parents)
++ if joints.ndim!=2 or joints.shape[1]!=3 or len(joints)<1 or not np.isfinite(joints).all():raise ValueError('joints must be a nonempty finite Nx3 array')
++ if raw_parents.shape!=(len(joints),) or not np.isfinite(raw_parents).all() or not np.equal(raw_parents,np.floor(raw_parents)).all():raise ValueError('parents must contain one integer per joint')
++ parents=raw_parents.astype(np.int64)
++ if np.any((parents< -1)|(parents>=len(joints))) or np.count_nonzero(parents==-1)!=1:raise ValueError('parents require one root and valid indices')
++ for i in range(len(parents)):
++  seen=set();current=i
++  while current!=-1:
++   if current in seen:raise ValueError('skeleton contains a parent cycle')
++   seen.add(current);current=int(parents[current])
++ return joints,parents
++
++def validate_rig(joints,parents,weights,vertex_count):
++ validate_skeleton(joints,parents);weights=np.asarray(weights)
++ if weights.shape!=(vertex_count,len(joints)) or not np.isfinite(weights).all():raise ValueError('weights must be finite with one row per source vertex and one column per joint')
++ if np.any(weights<0) or np.any(weights>1+1e-6) or not np.allclose(weights.sum(1),1,atol=1e-6,rtol=0):raise ValueError('weights must be nonnegative and normalized')
++
++def validate_override(actual_joints,actual_parents,supplied_joints,supplied_parents):
++ validate_skeleton(supplied_joints,supplied_parents)
++ if not np.array_equal(actual_parents,supplied_parents):raise ValueError('generated parents differ from supplied skeleton')
++ if not np.array_equal(actual_joints,supplied_joints):raise ValueError('final coordinates differ from supplied skeleton')
+diff --git a/test_generation_scores.py b/test_generation_scores.py
+new file mode 100644
+index 0000000..35c24ca
+--- /dev/null
++++ b/test_generation_scores.py
+@@ -0,0 +1,19 @@
++"""Regression for empty-history repetition penalty and nonempty preservation."""
++import argparse
++import torch
++from src.model.tokenrig import EmptyHistorySafeRepetitionPenalty as RepetitionPenaltyLogitsProcessor
++
++p=argparse.ArgumentParser();p.add_argument('--cpu-only',action='store_true');a=p.parse_args()
++use_mps=torch.backends.mps.is_available() and not a.cpu_only
++if use_mps: torch.mps.set_per_process_memory_fraction(.45)
++else: print('SKIP MPS: CPU-only request or backend unavailable')
++for device in (['cpu','mps'] if use_mps else ['cpu']):
++ torch.manual_seed(1234);scores=torch.randn((1,33036),device=device)
++ proc=RepetitionPenaltyLogitsProcessor(2.)
++ empty=torch.empty((1,0),dtype=torch.long,device=device)
++ actual=proc(empty,scores.clone())
++ assert torch.equal(actual.cpu(),scores.cpu()),f'{device}: empty history changed logits'
++ for ids in [[0],[0,0,3],[1,2,100]]:
++  ids=torch.tensor([ids],device=device);expected=scores.clone();selected=torch.gather(expected,1,ids);selected=torch.where(selected<0,selected*2,selected/2);expected.scatter_(1,ids,selected)
++  assert torch.equal(proc(ids,scores.clone()).cpu(),expected.cpu())
++ print('PASS',device,'empty history and repeated/nonempty token penalties')
+diff --git a/test_token_grammar.py b/test_token_grammar.py
+new file mode 100644
+index 0000000..7ac1513
+--- /dev/null
++++ b/test_token_grammar.py
+@@ -0,0 +1,21 @@
++"""Regression checks for complete SkinTokens code sequences, research only."""
++import numpy as np,torch
++from src.model.tokenrig import VocabSwitchingLogitsProcessor
++from src.tokenizer.parse import get_tokenizer
++from src.tokenizer.spec import TokenizeInput
++
++def tokenizer():
++ return get_tokenizer(__target__='tokenizer_part',num_discrete=256,continuous_range=[-1,1],cls_token_id={'articulation':0},parts_token_id={'body':0,'hand':1})
++
++def check(parents):
++ t=tokenizer();joints=np.stack([np.linspace(-.8,.8,len(parents)),np.linspace(.1,.9,len(parents)),np.linspace(-.3,.6,len(parents))],1)
++ sk=t.tokenize(TokenizeInput(joints=joints,parents=parents,cls='articulation'));J=t.bones_in_sequence(sk);assert J==len(parents)
++ eos=t.vocab_size+32768;proc=VocabSwitchingLogitsProcessor(t,t.eos,eos,4,torch.tensor(sk))
++ for count in [0,J*4-1,J*4]:
++  score=proc(torch.full((1,count),t.vocab_size),torch.zeros(1,eos+1))[0]
++  if count==J*4:
++   assert torch.isfinite(score[eos]);assert torch.isfinite(score).sum()==1
++  else:
++   assert not torch.isfinite(score[eos]);assert torch.isfinite(score[t.vocab_size]);assert not torch.isfinite(score[:t.vocab_size]).any()
++ print('PASS',parents,'complete skin count',J*4)
++for p in [[-1],[-1,0,1],[-1,0,0,2]]:check(p)
+diff --git a/test_rig_validation.py b/test_rig_validation.py
+new file mode 100644
+index 0000000..48679d5
+--- /dev/null
++++ b/test_rig_validation.py
+@@ -0,0 +1,13 @@
++import numpy as np
++from rig_validation import validate_skeleton,validate_rig,validate_override
++
++def rejects(fn, *args):
++ try:fn(*args)
++ except ValueError:return
++ raise AssertionError('invalid candidate accepted')
++j=np.array([[0.,0.,0.],[0.,1.,0.],[1.,1.,0.]]);p=np.array([-1,0,1]);w=np.array([[.1,.3,.6],[.9,.1,0.]])
++validate_skeleton(j,p);validate_rig(j,p,w,2);validate_override(j,p,j.copy(),p.copy())
++rejects(validate_skeleton,j,np.array([-1,-1,1]));rejects(validate_skeleton,j,np.array([-1,2,1]));rejects(validate_skeleton,j,np.array([-1,0,99]));rejects(validate_skeleton,j,np.array([-1,0,.5]));bad=j.copy();bad[1,0]=np.nan;rejects(validate_skeleton,bad,p)
++rejects(validate_rig,j,p,w[:1],2);rejects(validate_rig,j,p,np.full((2,3),np.nan),2);rejects(validate_rig,j,p,np.array([[1.,-1.,1.],[1.,0.,0.]]),2);rejects(validate_rig,j,p,w*.9,2)
++bad=j.copy();bad[1,1]+=.0001;rejects(validate_override,bad,p,j,p);rejects(validate_override,j,np.array([-1,0,0]),j,p)
++print('PASS valid rig and exact override; invalid tree, indices, finite values, weights, and override mismatches rejected')
+diff --git a/test_generation_configuration.py b/test_generation_configuration.py
+new file mode 100644
+index 0000000..e49b6c8
+--- /dev/null
++++ b/test_generation_configuration.py
+@@ -0,0 +1,27 @@
++"""CPU regressions for generation-config resolution and processor ordering."""
++import torch
++from transformers import Qwen3Config,Qwen3ForCausalLM,GenerationConfig
++from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
++from src.model import tokenrig
++from src.tokenizer.parse import get_tokenizer
++
++torch.set_num_threads(2)
++t=get_tokenizer(__target__='tokenizer_part',num_discrete=256,continuous_range=[-1,1],cls_token_id={'articulation':0},parts_token_id={'body':0,'hand':1})
++m=Qwen3ForCausalLM(Qwen3Config(vocab_size=33036,hidden_size=16,intermediate_size=32,num_hidden_layers=1,num_attention_heads=2,num_key_value_heads=1))
++install=getattr(tokenrig,'install_empty_history_repetition_guard',None)
++if install is not None:install(m)
++def processors(config):
++ config._eos_token_tensor=torch.tensor([33035]);return m._get_logits_processor(generation_config=config,input_ids_seq_length=0,encoder_input_ids=torch.empty(1,0,dtype=torch.long),device='cpu',model_kwargs={},logits_processor=tokenrig.get_logits_processor(t,33035,4,torch.tensor([t.bos,266])))
++for name,base,kwargs,expected in [('explicit',GenerationConfig(),{'repetition_penalty':2.},2.),('config_only',GenerationConfig(repetition_penalty=2.),{},2.),('config_plus_explicit',GenerationConfig(repetition_penalty=2.),{'repetition_penalty':3.},3.)]:
++ resolved,_=m._prepare_generation_config(base,**kwargs);p=processors(resolved)
++ repeat=[x for x in p if isinstance(x,RepetitionPenaltyLogitsProcessor)]
++ assert len(repeat)==1 and isinstance(repeat[0],tokenrig.EmptyHistorySafeRepetitionPenalty),(name,[type(x).__name__ for x in p])
++ s=torch.zeros((1,33036));s[0,0]=8.;out=p(torch.tensor([[0]]),s)
++ assert torch.isclose(out[0,0],torch.tensor(8./expected)),(name,out[0,0])
++ print('PASS',name,'one penalty with resolved value',expected)
++p=processors(GenerationConfig(repetition_penalty=2.,remove_invalid_values=True));assert [type(x).__name__ for x in p][:2]==['EmptyHistorySafeRepetitionPenalty','InfNanRemoveLogitsProcessor']
++s=torch.zeros((1,33036));s[0,0]=-float('inf');out=p(torch.tensor([[0]]),s);assert out[0,0]==torch.finfo(torch.float32).min,out[0,0]
++print('PASS stock repetition/InfNan/grammar ordering')
++# Instance-local installation must leave a separate model's processor method intact.
++other=Qwen3ForCausalLM(m.config);assert other._get_logits_processor.__func__ is Qwen3ForCausalLM._get_logits_processor
++print('PASS separate model and installed library unchanged')
+diff --git a/test_conditioning_seed.py b/test_conditioning_seed.py
+new file mode 100644
+index 0000000..733747f
+--- /dev/null
++++ b/test_conditioning_seed.py
+@@ -0,0 +1,29 @@
++"""CPU regressions for VAE feature seed and wrapper-only seed forwarding."""
++import torch
++from torch import nn
++from types import SimpleNamespace
++from unittest.mock import patch
++from src.model.tokenrig import TokenRig
++from src.model.skin_vae.autoencoders.skin_fsq_cvae_model import SkinFSQCVAEModel
++
++torch.set_num_threads(2)
++class CapturingVAE(SkinFSQCVAEModel):
++ def __init__(self):nn.Module.__init__(self);self.seeds=[];self.eval()
++ def _encode(self,**kwargs):self.seeds.append(kwargs.get('seed'));return None,kwargs['cond'][:,:2,:2]
++class FakeTransformer(nn.Module):
++ def __init__(self):super().__init__();self.embedding=nn.Embedding(20,3);self.kwargs=[]
++ def get_input_embeddings(self):return self.embedding
++ def generate(self,**kwargs):
++  assert 'conditioning_seed' not in kwargs,'conditioning-only seed leaked into HF generation'
++  self.kwargs.append(kwargs);return torch.tensor([[5]])
++vae=CapturingVAE();x=torch.arange(600,dtype=torch.float32).reshape(1,100,6)/100
++first=vae._sample_features(x,8,seed=1234);again=vae._sample_features(x,8,seed=1234);different=vae._sample_features(x,8,seed=4321)
++assert torch.equal(first,again);assert not torch.equal(first,different);print('PASS actual VAE feature sampler same seed stable, different seeds differ')
++m=TokenRig.__new__(TokenRig);nn.Module.__init__(m);m.vae=SimpleNamespace(model=vae);m.mesh_encoder=nn.Identity();m.output_proj=nn.Identity();m.tokens_skin_cond=2;m.tokens_per_skin=4;m.eos=19;m.transformer=FakeTransformer();m.tokenizer=SimpleNamespace(bos=1,eos=2,pad=0,make_cls_head=lambda **kwargs:[3])
++with patch('src.model.tokenrig.encode_mesh_cond',return_value=torch.zeros(1,2,3)):
++ for seed in [1234,4321,None]:
++  kwargs={} if seed is None else {'conditioning_seed':seed}
++  m.generate(vertices=torch.zeros(4,3),normals=torch.zeros(4,3),cls='articulation',only_ids=True,max_new_tokens=1,**kwargs)
++assert vae.seeds==[1234,4321,None],vae.seeds
++assert all('conditioning_seed' not in k for k in m.transformer.kwargs)
++print('PASS explicit/default VAE seed forwarding; no HF seed kwarg; upstream default remains None')

@@ -1,0 +1,2 @@
+# Preserve verbatim upstream diff context, including whitespace.
+changes.patch -whitespace

@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/VAST-AI-Research/SkinTokens.git",
+  "revision": "273b691d35989d71cd17ff2895fdc735097b92d1",
+  "patch_sha256": "f3dbef5b03400a31e0035b8e5a2fd588f3d4f92d21b8c24807c419c3e3434154",
+  "scope": "experimental inference only; anatomical qualification required"
+}
