@@ -16,6 +16,12 @@ repair safeguards, and M2 Max timings,
 New finished exports use 4K textures; previews can use 2K. See
 [texture rebaking](docs/texture-rebake.md) for saved models.
 
+`feature/mps-performance` holds generic SAM generation, repair, export, and
+performance improvements. Custom viewers, rigging workflows, third-party model
+adapters, and project-specific experiments belong on
+[`feature/model-workflows`](https://github.com/doublesharp/sam3d-objects-mac/tree/feature/model-workflows)
+or in their consuming project's repository.
+
 > ⚠️ This is an unofficial community port. The model, weights and the
 > **SAM License** ([LICENSE](LICENSE)) belong to Meta. Your use of the weights
 > is governed by that license — this repository only adds macOS glue code.
