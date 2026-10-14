@@ -344,15 +344,20 @@ def auto_game_target_faces(source_glb_path, target_vertices):
 
 
 
-def finish_source_only(folder, source_path, output_name, progress=None):
+def finish_source_only(folder, source_path, output_name, progress=None, geometry_certificate=None):
     """Validate and export the detailed artifact without fitting or rebaking a LOD."""
     import json
     import trimesh
     from sam3d_objects.surface_repair import geometry_report, topology, RepairRejected
     scene=trimesh.load(source_path,force='scene',process=False)
     checks=[]
+    reused=[]
     for mesh in scene.geometry.values():
-        geometry=geometry_report(mesh.vertices,mesh.faces)
+        geometry = (geometry_certificate.report_for(mesh.vertices, mesh.faces)
+                    if geometry_certificate is not None else None)
+        reused.append(geometry is not None)
+        if geometry is None:
+            geometry=geometry_report(mesh.vertices,mesh.faces)
         geometry['winding_consistent']=topology(mesh.vertices,mesh.faces)['winding_consistent']
         uv=getattr(mesh.visual,'uv',None)
         if not geometry['strict_watertight'] or not geometry['orientable'] or not geometry['winding_consistent'] or (uv is not None and not np.isfinite(uv).all()):
@@ -366,7 +371,8 @@ def finish_source_only(folder, source_path, output_name, progress=None):
     if os.path.abspath(output_path)!=os.path.abspath(source_path):
         shutil.copy2(source_path,output_path)
     report={'status':'detailed_complete','source':os.path.basename(source_path),
-            'output':output_name,'geometry':checks,'game':{'status':'not_requested'}}
+            'output':output_name,'geometry':checks,'game':{'status':'not_requested'},
+            'strict_validation_reused':bool(reused) and all(reused)}
     with open(os.path.join(folder,'export-status.json'),'w') as f:
         json.dump(report,f,indent=2)
     if progress is not None:
@@ -513,6 +519,7 @@ def main():
         step("Running to_glb (texture baking ~1 min)…")
     # Geometry cleanup and the direct Gaussian bake use CPU implementations.
     # Legacy texture modes retain the MPS-compatible multiview renderer.
+    source_geometry_certificate = None
     try:
         if should_write_source_glb:
             if mesh_result is None:
@@ -550,13 +557,14 @@ def main():
             os.replace(source_export_path, source_glb_path)
             progress.advance("Export source GLB", 1)
             saved("mesh.glb", source_glb_path)
+            source_geometry_certificate = getattr(source_glb, '_sam3d_geometry_certificate', None)
             del source_glb
             gc.collect()
             empty_device_cache(render_device)
         else:
             ok("Using existing mesh.glb as the high-detail comparison source")
         if source_only:
-            return finish_source_only(folder,source_glb_path,out_name,progress)
+            return finish_source_only(folder,source_glb_path,out_name,progress, geometry_certificate=source_geometry_certificate)
         source_obj, source_mtl, source_texture = export_glb_to_obj_family(source_glb_path, folder, "mesh")
         saved("mesh.obj", source_obj)
         saved("mesh.mtl", source_mtl)

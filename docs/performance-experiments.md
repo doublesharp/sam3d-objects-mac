@@ -5,6 +5,13 @@
 Native CPU sparse indexing and CPU memory-mapped checkpoint loading avoid GPU
 allocation during load. These changes preserve convolution order and outputs.
 
+Fresh source-only exports may reuse an in-memory geometry certificate after the
+known export axis rotation. Reloaded oriented geometry must match exactly after
+UV seam deduplication and triangle normalization. Reversed winding and duplicate
+faces remain distinct. Finite geometry, indices, winding and UV checks still run.
+Changed geometry and existing files use full validation. Certificates are not
+persisted or trusted from metadata.
+
 ## Native CPU benchmarks
 
 The scripts in benchmarks/benchmark_native_indexing.py and

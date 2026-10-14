@@ -2041,6 +2041,14 @@ def to_glb(
         if experimental_retopo:
             experimental_pre_uv_normals = export_vertex_normals
 
+    source_geometry_certificate = None
+    if repair_stats is not None and not game_remesh and not experimental_retopo:
+        from sam3d_objects.geometry_certificate import from_validated_geometry
+        # The known export rotation only permutes/sign-flips axes, without rounding.
+        source_geometry_certificate = from_validated_geometry(
+            repair_reference_vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]),
+            repair_reference_faces, repair_stats.get("geometry"))
+
     if with_texture_baking:
         # parametrize mesh
         if experimental_retopo:
@@ -2195,6 +2203,8 @@ def to_glb(
 
     if repair_stats is not None:
         mesh.metadata["surface_repair"] = repair_stats
+    if source_geometry_certificate is not None:
+        mesh._sam3d_geometry_certificate = source_geometry_certificate
     return mesh
 
 
