@@ -6,9 +6,18 @@ splat and a **textured `.glb` mesh** — no CUDA, no NVIDIA GPU.
 
 The upstream model is CUDA-only. This fork replaces every CUDA-specific piece
 (spconv, gsplat, nvdiffrast, float64 kernels) with pure-PyTorch / MPS-friendly
-equivalents so the whole thing runs on the Mac's unified-memory GPU. See
-[PORT_LOG.md](PORT_LOG.md) for the full list of changes, and
+equivalents. Generation uses the Mac's MPS GPU; mesh decoding, repair, UV
+unwrapping, and texture baking currently use CPU implementations. See
+[optimized-export.md](docs/optimized-export.md) for the verified export defaults,
+repair safeguards, and M2 Max timings,
+[PORT_LOG.md](PORT_LOG.md) for the port changes, and
 [README.upstream.md](README.upstream.md) for Meta's original README.
+
+`feature/mps-performance` holds generic SAM generation, repair, export, and
+performance improvements. Custom viewers, rigging workflows, third-party model
+adapters, and project-specific experiments belong on
+[`feature/model-workflows`](https://github.com/doublesharp/sam3d-objects-mac/tree/feature/model-workflows)
+or in their consuming project's repository.
 
 > ⚠️ This is an unofficial community port. The model, weights and the
 > **SAM License** ([LICENSE](LICENSE)) belong to Meta. Your use of the weights
@@ -62,8 +71,10 @@ pip install -e .
 # 3. rembg (background removal) + trimesh/xatlas etc. are in requirements.txt
 ```
 
-`run.sh` expects the venv at `../s3d_env` (sibling of this repo). If yours lives
-elsewhere, it falls back to whatever `python3` is on your `PATH`.
+`run.sh` prefers `.venv` inside the repo, then `../s3d_env` (the guided setup
+location), then whatever `python3` is on your `PATH`. The verified environment
+and pinned Mac dependencies are recorded in `requirements-mps.txt` and
+`requirements-mps.lock.txt`.
 
 Key packages: `torch` (MPS), `hydra-core`, `omegaconf`, `trimesh`, `pymeshfix`,
 `xatlas`, `pyvista`, `rembg`, `moge`, `utils3d`, `gradio`.

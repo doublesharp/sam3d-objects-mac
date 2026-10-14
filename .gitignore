@@ -34,3 +34,14 @@ venv/
 # ── Editors ─────────────────────────────────────────────
 .idea/
 .vscode/
+
+# Local MPS install artifacts
+/.bootstrap/
+/.python/
+/.cache/
+/logs/
+/checkpoints/hf-download/
+
+# Private local inputs and installation observations
+/inputs/
+/INSTALLATION.json

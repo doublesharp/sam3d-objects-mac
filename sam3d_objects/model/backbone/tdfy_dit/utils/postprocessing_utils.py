@@ -94,6 +94,11 @@ def _fill_holes(
         visblity[face_id] += 1
     visblity = visblity.float() / num_views
 
+    # Topology grouping on MPS can return invalid component counts for large meshes.
+    # Keep visibility rasterization on the GPU, then run the graph work on CPU.
+    if device.type == "mps":
+        verts, faces, visblity = verts.cpu(), faces.cpu(), visblity.cpu()
+
     # Mincut
     ## construct outer faces
     edges, face2edge, edge_degrees = utils3d.torch.compute_edges(faces)
@@ -115,7 +120,7 @@ def _fill_holes(
     if verbose:
         tqdm.write(f"Found {inner_face_indices.shape[0]} invisible faces")
     if inner_face_indices.shape[0] == 0:
-        return verts, faces
+        return verts.to(device), faces.to(device)
 
     ## Construct dual graph (faces as nodes, edges as edges)
     dual_edges, dual_edge2edge = utils3d.torch.compute_dual_graph(face2edge)
@@ -362,8 +367,9 @@ def postprocess_mesh(
         remove_floaters = False
 
     if remove_floaters:
-        ft = torch.tensor(faces.astype(np.int64), device=_dev)
-        vt = torch.tensor(vertices, device=_dev).float()
+        # Arrays are already on CPU; graph cleanup gains nothing from an MPS round trip.
+        ft = torch.tensor(faces.astype(np.int64), device="cpu")
+        vt = torch.tensor(vertices, device="cpu").float()
         ccs = utils3d.torch.compute_connected_components(ft)
         if len(ccs) > 1:
             largest = max(len(cc) for cc in ccs)
@@ -1507,7 +1513,7 @@ def to_glb(
     fill_holes_num_views: int = 1000,
     texture_size: int = 1024,
     lambda_tv: float = 0.01,
-    texture_mode: str = "opt",   # "opt" (Adam) | "average" (smooth angle-weighted) | "fast"
+    texture_mode: str = "opt",   # "gaussian" (direct) | "opt" (Adam) | "average" | "fast"
     texture_views: int = 100,
     texture_render_resolution: int = 1024,
     game_remesh: bool = False,
@@ -1526,6 +1532,10 @@ def to_glb(
     use_vertex_color=False,
     rendering_engine: str = "nvdiffrast",  # nvdiffrast OR "pytorch3d"
     progress_callback=None,
+    surface_repair: Optional[bool] = None,
+    repair_resolution: Optional[int] = None,
+    repair_closing_radius: Optional[int] = None,
+    repair_report_path: Optional[str] = None,
 ) -> trimesh.Trimesh:
     """
     Convert a generated asset to a glb file.
@@ -1543,6 +1553,32 @@ def to_glb(
     vertices = mesh.vertices.float().cpu().numpy()
     faces = mesh.faces.cpu().numpy()
     vert_colors = mesh.vertex_attrs[:, :3].cpu().numpy()
+    repair_enabled = surface_repair if surface_repair is not None else (
+        with_mesh_postprocess and os.environ.get("SAM3D_SURFACE_REPAIR", "1").lower() not in ("0", "false", "off", "no")
+    )
+    export_vertex_normals = None
+    repair_stats = None
+    def repair_before_fit(source_vertices, source_faces):
+        nonlocal repair_stats
+        import json
+        from sam3d_objects.surface_repair import repair_surface as repair_geometry, RepairRejected
+        try:
+            repaired = repair_geometry(source_vertices, source_faces, resolution=repair_resolution,
+                                       closing_radius=repair_closing_radius)
+        except RepairRejected as exc:
+            if repair_report_path:
+                with open(repair_report_path, "w") as report_file:
+                    json.dump(exc.report, report_file, indent=2)
+            raise
+        repair_stats = repaired.report
+        if repair_report_path:
+            with open(repair_report_path, "w") as report_file:
+                json.dump(repair_stats, report_file, indent=2)
+        if verbose:
+            tqdm.write(f"Surface repair: {repair_stats['status']} in {repair_stats['seconds']:.2f}s")
+        _emit_progress(progress_callback, "Surface repair", 1)
+        return repaired.vertices, repaired.faces
+
     experimental_reference_vertices = None
     experimental_reference_faces = None
     experimental_report_stats = None
@@ -1571,7 +1607,7 @@ def to_glb(
                 faces.copy(),
                 simplify=source_simplify,
                 simplify_ratio=source_simplify_ratio,
-                fill_holes=fill_holes,
+                fill_holes=fill_holes and not repair_enabled,
                 fill_holes_max_hole_size=fill_holes_max_size,
                 fill_holes_max_hole_nbe=int(250 * np.sqrt(max(0.0, 1 - source_simplify_ratio))),
                 fill_holes_resolution=fill_holes_resolution,
@@ -1581,6 +1617,9 @@ def to_glb(
                 debug=debug,
                 verbose=verbose,
             )
+        if repair_enabled:
+            experimental_reference_vertices, experimental_reference_faces = repair_before_fit(
+                experimental_reference_vertices, experimental_reference_faces)
         _emit_progress(progress_callback, "Source mesh cleanup", 1)
         experimental_guide_vertices = experimental_reference_vertices
         experimental_guide_faces = experimental_reference_faces
@@ -1827,7 +1866,7 @@ def to_glb(
                     faces,
                     simplify=preclean_ratio > 0,
                     simplify_ratio=preclean_ratio,
-                    fill_holes=fill_holes,
+                    fill_holes=fill_holes and not repair_enabled,
                     fill_holes_max_hole_size=fill_holes_max_size,
                     fill_holes_max_hole_nbe=int(250 * np.sqrt(max(0.0, 1 - preclean_ratio))),
                     fill_holes_resolution=fill_holes_resolution,
@@ -1846,6 +1885,8 @@ def to_glb(
                     )
                 _emit_progress(progress_callback, "Skip pre-game cleanup", 1)
 
+        if repair_enabled:
+            vertices, faces = repair_before_fit(vertices, faces)
         vertices, faces = game_remesh_mesh(
             vertices,
             faces,
@@ -1863,7 +1904,7 @@ def to_glb(
             faces,
             simplify=simplify > 0,
             simplify_ratio=simplify,
-            fill_holes=fill_holes,
+            fill_holes=fill_holes and not repair_enabled,
             fill_holes_max_hole_size=fill_holes_max_size,
             fill_holes_max_hole_nbe=int(250 * np.sqrt(1 - simplify)),
             fill_holes_resolution=fill_holes_resolution,
@@ -1873,6 +1914,24 @@ def to_glb(
         )
         _emit_progress(progress_callback, "Mesh cleanup", 1)
 
+    if repair_enabled:
+        from scipy.spatial import cKDTree
+        from sam3d_objects.surface_repair import topology, RepairRejected
+        from sam3d_objects.experimental_retopo import seamless_vertex_normals
+        if not game_remesh and not experimental_retopo:
+            vertices, faces = repair_before_fit(vertices, faces)
+        else:
+            # Optimization must retain the closed surface and its own polygon budget.
+            final_topology = topology(vertices, faces)
+            if not final_topology['watertight'] or not final_topology['winding_consistent']:
+                raise RepairRejected('Game optimization broke the repaired surface', {'status':'rejected','after':final_topology})
+        if use_vertex_color and not with_texture_baking:
+            nearest = cKDTree(mesh.vertices.float().cpu().numpy()).query(vertices, workers=2)[1]
+            vert_colors = mesh.vertex_attrs[:, :3].cpu().numpy()[nearest]
+        export_vertex_normals = seamless_vertex_normals(vertices, faces)
+        if experimental_retopo:
+            experimental_pre_uv_normals = export_vertex_normals
+
     if with_texture_baking:
         # parametrize mesh
         if experimental_retopo:
@@ -1881,21 +1940,36 @@ def to_glb(
             )
             experimental_vertex_normals = experimental_pre_uv_normals[vmapping]
         else:
-            vertices, faces, uvs = parametrize_mesh(vertices, faces)
+            vertices, faces, uvs, vmapping = parametrize_mesh(vertices, faces, return_mapping=True)
+            if export_vertex_normals is not None:
+                export_vertex_normals = export_vertex_normals[vmapping]
         logger.info("Baking texture ...")
         _emit_progress(progress_callback, "UV unwrap", 1)
 
         direct_experimental_color = os.environ.get(
             "SAM3D_EXPERIMENTAL_DIRECT_COLOR", "0"
         ).strip().lower() in ("1", "true", "yes", "on")
-        if experimental_retopo and isinstance(app_rep, Gaussian) and direct_experimental_color:
+        if texture_mode == "gaussian" or (experimental_retopo and isinstance(app_rep, Gaussian) and direct_experimental_color):
+            if not isinstance(app_rep, Gaussian):
+                raise ValueError("Gaussian texture mode requires Gaussian appearance")
+            from sam3d_objects.experimental_retopo import seamless_vertex_normals
+            if not experimental_retopo:
+                splat_points = app_rep.get_xyz.detach().float().cpu().numpy()
+                splat_colors = app_rep.get_features[:, 0, :].detach().float().cpu().numpy() * 0.28209479177387814 + 0.5
+                splat_opacity = app_rep.get_opacity.detach().float().cpu().numpy()
+                splat_scales = app_rep.get_scaling.detach().float().cpu().numpy()
+                splat_rotations = app_rep.get_rotation.detach().float().cpu().numpy()
+            color_normals = experimental_vertex_normals if experimental_retopo else (
+                export_vertex_normals if export_vertex_normals is not None else seamless_vertex_normals(vertices, faces)
+            )
+            export_vertex_normals = color_normals
             from sam3d_objects.experimental_retopo import bake_gaussian_color_texture
 
             texture = bake_gaussian_color_texture(
                 vertices,
                 faces,
                 uvs,
-                experimental_vertex_normals,
+                color_normals,
                 splat_points,
                 splat_colors,
                 splat_opacity,
@@ -1971,6 +2045,7 @@ def to_glb(
         texture = Image.fromarray(texture)
         material = trimesh.visual.material.PBRMaterial(
             roughnessFactor=1.0,
+            metallicFactor=0.0,
             baseColorTexture=texture,
             normalTexture=normal_texture,
             baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
@@ -1997,6 +2072,9 @@ def to_glb(
                 [[1, 0, 0], [0, 0, -1], [0, 1, 0]]
             )
             mesh_kwargs["process"] = False
+        if export_vertex_normals is not None:
+            mesh_kwargs["vertex_normals"] = export_vertex_normals @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+            mesh_kwargs["process"] = False
         mesh = trimesh.Trimesh(**mesh_kwargs)
 
     if experimental_quad_path and experimental_report_stats is not None:
@@ -2006,6 +2084,8 @@ def to_glb(
         with open(report_path, "w", encoding="ascii") as report_file:
             json.dump(experimental_report_stats, report_file, indent=2)
 
+    if repair_stats is not None:
+        mesh.metadata["surface_repair"] = repair_stats
     return mesh
 
 
