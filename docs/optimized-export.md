@@ -1,6 +1,6 @@
 # Optimized Apple Silicon export
 
-The normal `run.sh` flow and `ply2glb.py` now use automatic surface repair and a direct Gaussian texture bake. Generated source meshes are repaired before UV unwrapping. Game meshes are fitted to that repaired source, so their polygon budget and sidecars remain consistent.
+The normal `run.sh` flow and `ply2glb.py` now use automatic surface repair and a direct Gaussian texture bake. Disconnected debris is removed on CPU before simplification. A closed source must remain closed and pass shape checks after reduction; failed reductions try Open3D and then retain the original geometry if necessary. Triangle-collapse cleanup also rejects changes that break closure or erase thin features. Generated source meshes are repaired before UV unwrapping. Game meshes are fitted to that repaired source, so their polygon budget and sidecars remain consistent.
 
 Run the full image workflow with `./run.sh`, or reuse a saved reconstruction:
 
