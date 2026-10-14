@@ -208,13 +208,16 @@ def repair_surface(vertices, faces, resolution=None, closing_radius=None, force=
     for i,x in enumerate(axes[0]):
         points = np.empty((len(yz),3),dtype=np.float32);points[:,0]=x;points[:,1:]=yz
         shell[i] = (_distance(scene,points)<=pitch*.75).reshape(shape[1:])
+    original_shell = shell.copy()
     sampled_at = time.perf_counter()
     if closing_radius:
         xyz = np.ogrid[tuple(slice(-closing_radius,closing_radius+1) for _ in range(3))]
         ball = sum(axis*axis for axis in xyz)<=closing_radius*closing_radius
         shell = ndimage.binary_closing(shell,structure=ball)
     solid = ndimage.binary_fill_holes(shell)
-    interior_voxels=int((solid & ~shell).sum())
+    # Closing may seal and fill a narrow interior before flood fill runs.
+    # Count added volume from both stages against the original distance shell.
+    interior_voxels=int((solid & ~original_shell).sum())
     if interior_voxels < max(1,int(solid.sum()*.05)):
         raise RepairRejected('Repair rejected: shell cannot establish a sufficient enclosed interior',
                              {'status':'rejected','before':before,'interior_voxels':interior_voxels})

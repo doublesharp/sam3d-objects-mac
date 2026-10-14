@@ -72,6 +72,7 @@ def export_settings():
     if mode not in ("gaussian", "average", "opt", "fast"):
         raise ValueError("SAM3D_TEXTURE_MODE must be gaussian, average, opt, or fast")
     return dict(texture_mode=mode, surface_repair=bool_env("SAM3D_SURFACE_REPAIR", True),
+                repair_force=bool_env("SAM3D_REPAIR_FORCE", False),
                 repair_resolution=optional_repair_setting(os.environ.get("SAM3D_REPAIR_RESOLUTION")),
                 repair_closing_radius=optional_repair_setting(os.environ.get("SAM3D_REPAIR_RADIUS")))
 
@@ -534,7 +535,7 @@ def main():
             experimental_quad_path=game_quad_path,
             experimental_normal_path=game_normal_path,
             experimental_source_is_clean=True,
-            **settings,
+            **{**settings, "repair_force": False},
             repair_report_path=os.path.join(folder, "mesh_game_repair_report.json"),
             with_mesh_postprocess=True,   # includes floater removal (remove_floaters default on)
             with_texture_baking=True,

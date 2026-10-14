@@ -156,3 +156,12 @@ def test_adaptive_repair_profile_uses_stronger_closing_for_compact_objects():
     from sam3d_objects.surface_repair import choose_repair_settings
     mesh=trimesh.creation.icosphere(subdivisions=1)
     assert choose_repair_settings(mesh.vertices)==(192,4)
+
+
+def test_forced_repair_counts_interior_sealed_by_closing_itself():
+    source=trimesh.creation.box(extents=[1,.08,1])
+    result=repair_surface(source.vertices,source.faces,force=True,resolution=128,closing_radius=6)
+    assert result.report['interior_voxels']>0
+    assert result.report['after']['watertight']
+    assert result.report['after']['boundary_edges']==result.report['after']['nonmanifold_edges']==0
+    assert result.report['surface_error_p95']<.035
